@@ -90,7 +90,11 @@ VOLUME /var/www/html/wp-content
 COPY wp-content/mu-plugins /var/www/html/wp-content/mu-plugins
 RUN mkdir /var/www/html/wp-content/cache
 
-
+# Create plugins directory and download Redis Cache plugin
+RUN mkdir -p /usr/src/wordpress/wp-content/plugins/redis-cache && \
+    curl -o /tmp/redis-cache.zip -L https://downloads.wordpress.org/plugin/redis-cache.latest-stable.zip && \
+    unzip /tmp/redis-cache.zip -d /usr/src/wordpress/wp-content/plugins/ && \
+    rm /tmp/redis-cache.zip && \
 
 RUN sed -i \
     -e 's/\[ "$1" = '\''php-fpm'\'' \]/\[\[ "$1" == frankenphp* \]\]/g' \
@@ -117,7 +121,12 @@ RUN chown -R ${USER}:${USER} /data/caddy && \
     chown -R ${USER}:${USER} /config/caddy && \
     chown -R ${USER}:${USER} /var/www/html && \
     chown -R ${USER}:${USER} /usr/src/wordpress && \
+    chown -R ${USER}:${USER} /var/www/html/uploads && \
     chown -R ${USER}:${USER} /usr/local/bin/docker-entrypoint.sh
+
+# Copy plugins to the volume
+RUN cp -r /usr/src/wordpress/wp-content/plugins/* /var/www/html/wp-content/plugins/ && \
+    chown -R ${USER}:${USER} /var/www/html/wp-content/plugins/
 
 USER $USER
 
