@@ -124,7 +124,7 @@ RUN chown -R ${USER}:${USER} /data/caddy && \
     chown -R ${USER}:${USER} /config/caddy && \
     chown -R ${USER}:${USER} /var/www/html && \
     chown -R ${USER}:${USER} /usr/src/wordpress && \
-    chown -R ${USER}:${USER} /usr/local/bin/docker-entrypoint.sh && \
+    chown -R ${USER}:${USER} /usr/local/bin/docker-entrypoint.sh
 
 USER $USER
 
