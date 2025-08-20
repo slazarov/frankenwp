@@ -116,15 +116,15 @@ COPY Caddyfile /etc/caddy/Caddyfile
 RUN useradd -D ${USER} && \
     setcap CAP_NET_BIND_SERVICE=+eip /usr/local/bin/frankenphp
 
+# Copy plugins to the volume
+RUN cp -r /usr/src/wordpress/wp-content/plugins/* /var/www/html/wp-content/plugins/
+
 # Caddy requires write access to /data/caddy and /config/caddy
 RUN chown -R ${USER}:${USER} /data/caddy && \
     chown -R ${USER}:${USER} /config/caddy && \
     chown -R ${USER}:${USER} /var/www/html && \
     chown -R ${USER}:${USER} /usr/src/wordpress && \
-    chown -R ${USER}:${USER} /usr/local/bin/docker-entrypoint.sh
-
-# Copy plugins to the volume
-RUN cp -r /usr/src/wordpress/wp-content/plugins/* /var/www/html/wp-content/plugins/ && \
+    chown -R ${USER}:${USER} /usr/local/bin/docker-entrypoint.sh && \
     chown -R ${USER}:${USER} /var/www/html/wp-content/plugins/
 
 USER $USER
