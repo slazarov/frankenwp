@@ -88,7 +88,7 @@ VOLUME /var/www/html/wp-content
 
 
 COPY wp-content/mu-plugins /var/www/html/wp-content/mu-plugins
-RUN mkdir /var/www/html/wp-content/cache
+RUN mkdir /var/www/html/wp-content/cache /var/www/html/uploads
 
 # Create plugins directory and download Redis Cache plugin
 RUN mkdir -p /usr/src/wordpress/wp-content/plugins/redis-cache && \
@@ -121,7 +121,6 @@ RUN chown -R ${USER}:${USER} /data/caddy && \
     chown -R ${USER}:${USER} /config/caddy && \
     chown -R ${USER}:${USER} /var/www/html && \
     chown -R ${USER}:${USER} /usr/src/wordpress && \
-    chown -R ${USER}:${USER} /var/www/html/uploads && \
     chown -R ${USER}:${USER} /usr/local/bin/docker-entrypoint.sh
 
 # Copy plugins to the volume
