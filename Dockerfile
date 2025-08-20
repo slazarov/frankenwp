@@ -88,7 +88,7 @@ VOLUME /var/www/html/wp-content
 
 
 COPY wp-content/mu-plugins /var/www/html/wp-content/mu-plugins
-RUN mkdir /var/www/html/wp-content/cache /var/www/html/uploads
+RUN mkdir /var/www/html/wp-content/cache /var/www/html/uploads /var/www/html/wp-content/plugins
 
 # Create plugins directory and download Redis Cache plugin
 RUN mkdir -p /usr/src/wordpress/wp-content/plugins/redis-cache && \
