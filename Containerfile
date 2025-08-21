@@ -83,19 +83,16 @@ WORKDIR /var/www/html
 
 # Modify scripts, create directories, install WP-CLI, and clean up in one layer
 RUN mkdir -p /var/www/html/wp-content/cache /var/www/html/wp-content/uploads /var/www/html/wp-content/plugins \
-    && sed -i \
-        -e 's/\[ "$1" = '\''php-fpm'\'' \]/\[\[ "$1" == frankenphp* \]\]/g' \
-        -e 's/php-fpm/frankenphp/g' \
-        /usr/local/bin/docker-entrypoint.sh \
-    && sed -i '/exec "\$@"/{
-        r /tmp/plugins-install.sh
-        a\
-    }' /usr/local/bin/docker-entrypoint.sh \
+    && sed -i -e 's/\[ "$1" = '\''php-fpm'\'' \]/\[\[ "$1" == frankenphp* \]\]/g' \
+           -e 's/php-fpm/frankenphp/g' \
+           /usr/local/bin/docker-entrypoint.sh \
+    && sed -i '/exec "\$@"/e cat /tmp/plugins-install.sh && echo ""' /usr/local/bin/docker-entrypoint.sh \
     && rm /tmp/plugins-install.sh \
     && sed -i 's/<?php/<?php if (!!getenv("FORCE_HTTPS")) { \$_SERVER["HTTPS"] = "on"; } define( "FS_METHOD", "direct" ); set_time_limit(300); /g' /usr/src/wordpress/wp-config-docker.php \
     && curl -O https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar \
     && chmod +x wp-cli.phar \
     && mv wp-cli.phar /usr/local/bin/wp
+
 
 
 # Declare volume after preparing directories
