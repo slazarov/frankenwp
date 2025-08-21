@@ -1,5 +1,5 @@
 ARG WORDPRESS_VERSION=latest
-ARG PHP_VERSION=8.4.11
+ARG PHP_VERSION=8.4
 ARG USER=www-data
 
 FROM docker.io/dunglas/frankenphp:builder-php${PHP_VERSION} as builder
@@ -82,7 +82,7 @@ COPY wp-content/mu-plugins /var/www/html/wp-content/mu-plugins
 WORKDIR /var/www/html
 
 # Modify scripts, create directories, install WP-CLI, and clean up in one layer
-RUN mkdir -p /var/www/html/wp-content/cache /var/www/html/wp-content/uploads /var/www/html/wp-content/plugins \
+RUN mkdir -p /var/www/html/wp-content/cache \
     && sed -i -e 's/\[ "$1" = '\''php-fpm'\'' \]/\[\[ "$1" == frankenphp* \]\]/g' \
            -e 's/php-fpm/frankenphp/g' \
            /usr/local/bin/docker-entrypoint.sh \
@@ -92,8 +92,6 @@ RUN mkdir -p /var/www/html/wp-content/cache /var/www/html/wp-content/uploads /va
     && curl -O https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar \
     && chmod +x wp-cli.phar \
     && mv wp-cli.phar /usr/local/bin/wp
-
-
 
 # Declare volume after preparing directories
 VOLUME /var/www/html/wp-content
