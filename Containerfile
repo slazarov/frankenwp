@@ -87,13 +87,16 @@ RUN mkdir -p /var/www/html/wp-content/cache /var/www/html/wp-content/uploads /va
         -e 's/\[ "$1" = '\''php-fpm'\'' \]/\[\[ "$1" == frankenphp* \]\]/g' \
         -e 's/php-fpm/frankenphp/g' \
         /usr/local/bin/docker-entrypoint.sh \
-    && sed -i '/exec "\$@"/i /tmp/plugins-install.sh' /usr/local/bin/docker-entrypoint.sh \
-    && sed -i '/exec "\$@"/i \ ' /usr/local/bin/docker-entrypoint.sh \
+    && sed -i '/exec "\$@"/{
+        r /tmp/plugins-install.sh
+        a\
+    }' /usr/local/bin/docker-entrypoint.sh \
     && rm /tmp/plugins-install.sh \
     && sed -i 's/<?php/<?php if (!!getenv("FORCE_HTTPS")) { \$_SERVER["HTTPS"] = "on"; } define( "FS_METHOD", "direct" ); set_time_limit(300); /g' /usr/src/wordpress/wp-config-docker.php \
     && curl -O https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar \
     && chmod +x wp-cli.phar \
     && mv wp-cli.phar /usr/local/bin/wp
+
 
 # Declare volume after preparing directories
 VOLUME /var/www/html/wp-content
