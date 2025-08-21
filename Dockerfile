@@ -78,6 +78,8 @@ RUN install-php-extensions \
 RUN cp $PHP_INI_DIR/php.ini-production $PHP_INI_DIR/php.ini
 COPY php.ini $PHP_INI_DIR/conf.d/wp.ini
 
+COPY custom-entrypoint.sh /usr/local/bin/
+
 COPY --from=wp /usr/src/wordpress /usr/src/wordpress
 COPY --from=wp /usr/local/etc/php/conf.d /usr/local/etc/php/conf.d/
 COPY --from=wp /usr/local/bin/docker-entrypoint.sh /usr/local/bin/
@@ -128,5 +130,5 @@ RUN chown -R ${USER}:${USER} /data/caddy && \
 
 USER $USER
 
-ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+ENTRYPOINT ["/usr/local/bin/custom-entrypoint.sh"]
 CMD ["frankenphp", "run", "--config", "/etc/caddy/Caddyfile"]
