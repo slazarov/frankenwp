@@ -83,8 +83,7 @@ COPY wp-content/mu-plugins /var/www/html/wp-content/mu-plugins
 WORKDIR /var/www/html
 
 # Modify scripts, create directories, install WP-CLI, and clean up in one layer
-RUN chmod +x /usr/local/bin/custom-entrypoint.sh /usr/local/bin/docker-entrypoint.sh \
-    && mkdir -p /var/www/html/wp-content/cache /var/www/html/wp-content/uploads /var/www/html/wp-content/plugins \
+RUN mkdir -p /var/www/html/wp-content/cache /var/www/html/wp-content/uploads /var/www/html/wp-content/plugins \
     && sed -i \
     -e 's/\[ "$1" = '\''php-fpm'\'' \]/\[\[ "$1" == frankenphp* \]\]/g' \
     -e 's/php-fpm/frankenphp/g' \
