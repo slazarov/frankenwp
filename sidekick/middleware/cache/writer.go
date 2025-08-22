@@ -31,12 +31,6 @@ func (r *CustomWriter) Header() http.Header {
 func (r *CustomWriter) WriteHeader(status int) {
 	r.Logger.Debug("==========-SetHeader-==========")
 	r.status = status
-
-	// Remove any existing cache control headers
-	r.Header().Del("Cache-Control")
-	r.Header().Del("Pragma")
-	r.Header().Del("Expires")
-
 	r.ResponseWriter.WriteHeader(status)
 }
 
@@ -46,10 +40,6 @@ func (r *CustomWriter) Write(b []byte) (int, error) {
 	// content encoding
 	ct := r.Header().Get("Content-Encoding")
 	r.Header().Set("X-WPEverywhere-Cache", "MISS")
-
-	// Set cache control headers for cacheable responses
-	r.Header().Set("Cache-Control", "public, max-age=31536000, s-maxage=31536000, immutable")
-
 	bypass := true
 
 	// check if the response code is in the cache response codes

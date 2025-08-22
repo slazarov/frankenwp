@@ -260,15 +260,9 @@ func (c Cache) ServeHTTP(w http.ResponseWriter, r *http.Request,
 	}
 
 	if err == nil {		
-		// Override any existing cache headers
-		w.Header().Del("Cache-Control")
-		w.Header().Del("Pragma")
-		w.Header().Del("Expires")
-
-		// Set our cache headers
-		w.Header().Set("Cache-Control", "public, max-age=31536000, s-maxage=31536000, immutable")
 		w.Header().Set("X-WPEverywhere-Cache", "HIT")
 		w.Header().Set("Content-Type", "text/html; charset=UTF-8")
+		w.Header().Set("Server", "Caddy")
 		w.Header().Set("Vary", "Accept-Encoding")
 		w.Header().Set("Content-Encoding", encoding)
 		w.Write(cacheItem)
