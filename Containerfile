@@ -7,7 +7,7 @@ FROM docker.io/dunglas/frankenphp:builder-php${PHP_VERSION} as builder
 # Copy xcaddy in the builder image
 COPY --from=caddy:builder /usr/bin/xcaddy /usr/bin/xcaddy
 
-COPY ./sidekick/middleware/cache ./cache
+#COPY ./sidekick/middleware/cache ./cache
 
 RUN CGO_ENABLED=1 \
     XCADDY_SETCAP=1 \
@@ -18,9 +18,9 @@ RUN CGO_ENABLED=1 \
     --output /usr/local/bin/frankenphp \
     --with github.com/dunglas/frankenphp=./ \
     --with github.com/dunglas/frankenphp/caddy=./caddy/ \
-    --with github.com/dunglas/caddy-cbrotli \
+    --with github.com/dunglas/caddy-cbrotli
     # Add extra Caddy modules here
-    --with github.com/stephenmiracle/frankenwp/sidekick/middleware/cache=./cache
+#    --with github.com/stephenmiracle/frankenwp/sidekick/middleware/cache=./cache
 
 FROM docker.io/wordpress:$WORDPRESS_VERSION as wp
 FROM docker.io/dunglas/frankenphp:php${PHP_VERSION} AS base
