@@ -7,20 +7,32 @@ FROM docker.io/dunglas/frankenphp:builder-php${PHP_VERSION} as builder
 # Copy xcaddy in the builder image
 COPY --from=caddy:builder /usr/bin/xcaddy /usr/bin/xcaddy
 
-#COPY ./sidekick/middleware/cache ./cache
+# build cache for FrankenPHP
+RUN --mount=type=cache,target=/root/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go mod download
 
-RUN CGO_ENABLED=1 \
-    XCADDY_SETCAP=1 \
-    XCADDY_GO_BUILD_FLAGS="-ldflags='-w -s' -tags=nobadger,nomysql,nopgx" \
+# build cache for sidekick cache
+COPY ./sidekick/middleware/cache/go.mod ./sidekick/middleware/cache/go.sum ./cache/
+RUN --mount=type=cache,target=/root/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    cd ./cache/ && go mod download
+
+COPY ./sidekick/middleware/cache ./cache
+
+# CGO must be enabled to build FrankenPHP
+RUN --mount=type=cache,target=/root/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=1 XCADDY_SETCAP=1 XCADDY_GO_BUILD_FLAGS='-ldflags="-w -s" -trimpath' \
     CGO_CFLAGS=$(php-config --includes) \
     CGO_LDFLAGS="$(php-config --ldflags) $(php-config --libs)" \
     xcaddy build \
     --output /usr/local/bin/frankenphp \
     --with github.com/dunglas/frankenphp=./ \
     --with github.com/dunglas/frankenphp/caddy=./caddy/ \
-    --with github.com/dunglas/caddy-cbrotli
+    --with github.com/dunglas/caddy-cbrotli \
     # Add extra Caddy modules here
-#    --with github.com/stephenmiracle/frankenwp/sidekick/middleware/cache=./cache
+    --with github.com/stephenmiracle/frankenwp/sidekick/middleware/cache=./cache
 
 FROM docker.io/wordpress:$WORDPRESS_VERSION as wp
 FROM docker.io/dunglas/frankenphp:php${PHP_VERSION} AS base
