@@ -42,7 +42,7 @@
 		purge_path {$PURGE_PATH:/__cache/purge}
 		purge_key {$PURGE_KEY}
 		bypass_home {$BYPASS_HOME:false}
-		bypass_path_prefixes {$BYPASS_PATH_PREFIXES:/wp-admin,/wp-json,/lokatsiya}
+		bypass_path_prefixes {$BYPASS_PATH_PREFIXES:/wp-admin,/wp-json}
 	}
 
 	{$CADDY_SERVER_EXTRA_DIRECTIVES}

@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"bytes"
 	"net/http"
 	"net/url"
 	"slices"
@@ -60,9 +61,41 @@ func (r *CustomWriter) Unwrap() http.ResponseWriter {
 	return r.ResponseWriter
 }
 
+// shouldBypassCacheForContent checks if the response content contains patterns
+// that indicate it should not be cached (e.g., consent management, lazy-loaded iframes)
+func shouldBypassCacheForContent(content []byte) bool {
+	// Patterns that indicate dynamic content requiring JavaScript execution
+	problematicPatterns := [][]byte{
+		[]byte("_iub_cs_activate"),          // Iubenda consent management
+		[]byte("cmplazyload"),                // Consent manager lazy load
+		[]byte("data-suppressedsrc"),         // Suppressed iframe sources
+		[]byte("data-cmp-"),                  // Consent Management Platform attributes
+		[]byte("cookiebot"),                  // Cookiebot consent
+		[]byte("OneTrust"),                   // OneTrust consent
+		[]byte("CookieConsent"),              // Generic cookie consent
+		[]byte("data-cookieconsent"),         // Cookie consent data attributes
+		[]byte("gdpr-consent"),               // GDPR consent markers
+	}
+
+	for _, pattern := range problematicPatterns {
+		if bytes.Contains(content, pattern) {
+			return true
+		}
+	}
+
+	return false
+}
+
 // set cache on response end
 func (r *CustomWriter) Close() error {
 	if atomic.LoadInt32(&r.needCache) == 1 {
+		// Check if content contains patterns that should bypass cache
+		if shouldBypassCacheForContent(r.buf) {
+			r.Logger.Debug("Bypassing cache due to consent management or lazy-loaded content",
+				zap.String("path", r.origUrl.Path))
+			return nil
+		}
+
 		hdr := r.ResponseWriter.Header()
 		meta := NewCacheMeta(int(atomic.LoadInt32(&r.status)), hdr, r.buf)
 		if meta == nil {
