@@ -64,7 +64,7 @@ func (r *CustomWriter) Unwrap() http.ResponseWriter {
 func (r *CustomWriter) Close() error {
 	if atomic.LoadInt32(&r.needCache) == 1 {
 		hdr := r.ResponseWriter.Header()
-		meta := NewCacheMeta(int(atomic.LoadInt32(&r.status)), hdr)
+		meta := NewCacheMeta(int(atomic.LoadInt32(&r.status)), hdr, r.buf)
 		if meta == nil {
 			return nil
 		}

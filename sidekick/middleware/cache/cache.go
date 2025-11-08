@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"net/http"
 
@@ -259,6 +260,50 @@ func (Cache) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
+// checkConditionalRequest checks if the request is conditional and returns true if 304 should be sent
+func checkConditionalRequest(r *http.Request, cacheMeta *CacheMeta) bool {
+	// Get ETag and Last-Modified from cache metadata
+	var cachedETag, cachedLastModified string
+	for _, kv := range cacheMeta.Header {
+		if len(kv) != 2 {
+			continue
+		}
+		if kv[0] == "Etag" {
+			cachedETag = kv[1]
+		}
+		if kv[0] == "Last-Modified" {
+			cachedLastModified = kv[1]
+		}
+	}
+
+	// Check If-None-Match (ETag)
+	if ifNoneMatch := r.Header.Get("If-None-Match"); ifNoneMatch != "" && cachedETag != "" {
+		// Handle multiple ETags (comma-separated)
+		for _, tag := range strings.Split(ifNoneMatch, ",") {
+			tag = strings.TrimSpace(tag)
+			if tag == cachedETag || tag == "*" {
+				return true
+			}
+		}
+	}
+
+	// Check If-Modified-Since
+	if ifModifiedSince := r.Header.Get("If-Modified-Since"); ifModifiedSince != "" && cachedLastModified != "" {
+		ifModTime, err := http.ParseTime(ifModifiedSince)
+		if err == nil {
+			cachedModTime, err := http.ParseTime(cachedLastModified)
+			if err == nil {
+				// If the cached content hasn't been modified since the time specified
+				if !cachedModTime.After(ifModTime) {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
+}
+
 // ServeHTTP implements the caddy.Handler interface.
 func (c *Cache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	bypass := false
@@ -370,9 +415,28 @@ func (c *Cache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp
 			go c.doCache(r, next)
 		}
 
-		// TODO: implement 304 Not Modified reponse for
-		// ETag (If-Match, If-None-Match)
-		// Last-Modified (If-Modified-Since, If-Unmodified-Since)
+		// Check for conditional requests (If-None-Match, If-Modified-Since)
+		if checkConditionalRequest(r, cacheMeta) {
+			// Set cache headers
+			hdr.Set(c.CacheHeaderName, "HIT")
+			hdr.Set("Vary", "Accept-Encoding")
+
+			// Set validation headers for 304 response
+			for _, kv := range cacheMeta.Header {
+				if len(kv) != 2 {
+					continue
+				}
+				// Only set ETag, Last-Modified, and Cache-Control for 304
+				if kv[0] == "Etag" || kv[0] == "Last-Modified" || kv[0] == "Cache-Control" {
+					hdr.Set(kv[0], kv[1])
+				}
+			}
+
+			// Return 304 Not Modified without body
+			w.WriteHeader(http.StatusNotModified)
+			c.logger.Debug("wp cache - 304 Not Modified", zap.String("path", r.URL.Path))
+			return nil
+		}
 
 		hdr.Set(c.CacheHeaderName, "HIT")
 		hdr.Set("Vary", "Accept-Encoding")
