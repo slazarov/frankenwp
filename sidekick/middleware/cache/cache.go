@@ -259,6 +259,69 @@ func (Cache) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
+// checkConditionalRequest checks if the request has conditional headers
+// and if the cached content matches those conditions
+// Returns true if content hasn't changed (should return 304)
+func checkConditionalRequest(r *http.Request, cacheMeta *CacheMeta) bool {
+	// Check If-None-Match (ETag validation)
+	ifNoneMatch := r.Header.Get("If-None-Match")
+	if ifNoneMatch != "" {
+		// Extract ETag from cached headers
+		cachedETag := ""
+		for _, kv := range cacheMeta.Header {
+			if len(kv) == 2 && kv[0] == "Etag" {
+				cachedETag = kv[1]
+				break
+			}
+		}
+
+		if cachedETag != "" {
+			// Check if ETags match
+			// Support both W/"xxx" and "xxx" formats, and multiple ETags in If-None-Match
+			// Simple string comparison is sufficient for most cases
+			if ifNoneMatch == cachedETag || ifNoneMatch == "*" {
+				return true
+			}
+			// Check comma-separated list of ETags
+			for _, etag := range strings.Split(ifNoneMatch, ",") {
+				etag = strings.TrimSpace(etag)
+				if etag == cachedETag {
+					return true
+				}
+			}
+		}
+	}
+
+	// Check If-Modified-Since (Last-Modified validation)
+	ifModifiedSince := r.Header.Get("If-Modified-Since")
+	if ifModifiedSince != "" {
+		// Extract Last-Modified from cached headers
+		cachedLastModified := ""
+		for _, kv := range cacheMeta.Header {
+			if len(kv) == 2 && kv[0] == "Last-Modified" {
+				cachedLastModified = kv[1]
+				break
+			}
+		}
+
+		if cachedLastModified != "" {
+			// Parse both times
+			ifModTime, err1 := http.ParseTime(ifModifiedSince)
+			lastModTime, err2 := http.ParseTime(cachedLastModified)
+
+			// If parsing succeeded and content hasn't been modified, return 304
+			if err1 == nil && err2 == nil {
+				// Content not modified if cached time is before or equal to request time
+				if !lastModTime.After(ifModTime) {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
+}
+
 // ServeHTTP implements the caddy.Handler interface.
 func (c *Cache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	bypass := false
@@ -370,10 +433,29 @@ func (c *Cache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp
 			go c.doCache(r, next)
 		}
 
-		// TODO: implement 304 Not Modified reponse for
-		// ETag (If-Match, If-None-Match)
-		// Last-Modified (If-Modified-Since, If-Unmodified-Since)
+		// Check for conditional requests (If-None-Match, If-Modified-Since)
+		if checkConditionalRequest(r, cacheMeta) {
+			// Content hasn't changed, return 304 Not Modified
+			hdr.Set(c.CacheHeaderName, "HIT-304")
+			hdr.Set("Vary", "Accept-Encoding")
 
+			// Set validation headers (ETag, Last-Modified) from cache
+			for _, kv := range cacheMeta.Header {
+				if len(kv) != 2 {
+					continue
+				}
+				// Only include specific headers for 304 response
+				if kv[0] == "Etag" || kv[0] == "Last-Modified" || kv[0] == "Cache-Control" || kv[0] == "Expires" {
+					hdr.Set(kv[0], kv[1])
+				}
+			}
+
+			w.WriteHeader(http.StatusNotModified) // 304
+			// Don't send body for 304 responses
+			return nil
+		}
+
+		// No conditional request or content has changed, send full response
 		hdr.Set(c.CacheHeaderName, "HIT")
 		hdr.Set("Vary", "Accept-Encoding")
 		if ce != "none" {

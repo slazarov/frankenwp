@@ -1,7 +1,9 @@
 package cache
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"slices"
@@ -89,7 +91,13 @@ type CacheMeta struct {
 	contentEncoding string
 }
 
-func NewCacheMeta(stateCode int, hdr http.Header) *CacheMeta {
+// GenerateETag creates an ETag from the response body using SHA256
+func GenerateETag(data []byte) string {
+	hash := sha256.Sum256(data)
+	return fmt.Sprintf(`W/"%x"`, hash[:16]) // Use first 16 bytes for shorter ETag
+}
+
+func NewCacheMeta(stateCode int, hdr http.Header, data []byte) *CacheMeta {
 	// content encoding
 	ce := hdr.Get("Content-Encoding")
 	if ce == "" {
@@ -108,6 +116,19 @@ func NewCacheMeta(stateCode int, hdr http.Header) *CacheMeta {
 
 		contentEncoding: ce,
 	}
+
+	// Generate and set ETag if not already present
+	if hdr.Get("Etag") == "" && len(data) > 0 {
+		etag := GenerateETag(data)
+		hdr.Set("Etag", etag)
+	}
+
+	// Set Last-Modified if not already present
+	if hdr.Get("Last-Modified") == "" {
+		lastModified := time.Unix(meta.Timestamp, 0).UTC().Format(http.TimeFormat)
+		hdr.Set("Last-Modified", lastModified)
+	}
+
 	meta.SetHeader(hdr)
 	return meta
 }
