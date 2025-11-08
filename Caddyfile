@@ -22,10 +22,16 @@
 # You may not have the hostname being called due to dynamic IPs and load balancers.
 # Allowing all hosts on port 80 for health checks, local dev & cases where the hostname is unknown.
 {$SERVER_NAME:localhost} {
-    @static {
-       file
-       path *.ico *.css *.js *.gif *.jpg *.jpeg *.png *.svg *.woff *.webp
-    }
+	@static {
+		file
+		path *.ico *.css *.js *.gif *.jpg *.jpeg *.png *.svg *.woff *.woff2 *.ttf *.webp
+	}
+
+	# Set long cache times for static assets (1 year)
+	# Safe because WordPress uses versioned URLs (?ver=x.x.x)
+	header @static {
+		Cache-Control "public, max-age=31536000, immutable"
+	}
 
     @disallowed {
        path /xmlrpc.php
