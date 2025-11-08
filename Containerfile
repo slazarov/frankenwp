@@ -63,8 +63,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libzip-dev \
     unzip \
     git \
-    less \
-    libmimalloc3 \
     libjpeg-dev \
     libwebp-dev \
     libmemcached-dev \
@@ -81,20 +79,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     imagick/imagick@master \
     opcache \
     redis \
-    pdo_pgsql \
-    pdo_mysql \
-    pdo_odbc \
-    pgsql \
-    bz2 \
-    apcu \
-    shmop \
-    sysvshm \
-    brotli \
-    zstd \
-    simdjson \
-    igbinary \
-    msgpack \
-    memcached \
     && cp $PHP_INI_DIR/php.ini-production $PHP_INI_DIR/php.ini \
     && apt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false \
     && apt-get clean \
@@ -132,9 +116,6 @@ RUN useradd -D ${USER} \
     && chown -R ${USER}:${USER} /data/caddy /config/caddy /var/www/html /usr/src/wordpress /usr/local/bin/docker-entrypoint.sh
 
 USER $USER
-
-# use mimalloc by LD_PRELOAD for better memory performance
-ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libmimalloc.so.3
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["frankenphp", "run", "--config", "/etc/caddy/Caddyfile"]
