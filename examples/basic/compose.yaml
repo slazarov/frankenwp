@@ -19,6 +19,9 @@ services:
       BYPASS_HOME: ${BYPASS_HOME:-false}
       BYPASS_PATH_PREFIXES: ${BYPASS_PATH_PREFIXES:-/wp-admin,/wp-content,/wp-includes,/wp-json,/feed}
       CACHE_RESPONSE_CODES: ${CACHE_RESPONSE_CODES:-000}
+      # Cloudflare cache purging (optional)
+      CLOUDFLARE_ZONE_ID: ${CLOUDFLARE_ZONE_ID:-}
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
       CADDY_GLOBAL_OPTIONS: |
         email myemail@sample.com
         auto_https disable_redirects
