@@ -33,30 +33,6 @@
 		Cache-Control "public, max-age=31536000, immutable"
 	}
 
-	# WebP auto-serving configuration
-	# Serve WebP to browsers that support it when the .webp file exists
-	@webp_with_file {
-		header Accept *image/webp*
-		path /wp-content/uploads/*.jpg /wp-content/uploads/*.jpeg /wp-content/uploads/*.png /wp-content/uploads/*.gif
-		file {path}.webp
-	}
-	rewrite @webp_with_file {path}.webp
-
-	# For browsers supporting WebP but no .webp file exists yet, trigger conversion
-	@webp_needs_convert {
-		header Accept *image/webp*
-		path /wp-content/uploads/*.jpg /wp-content/uploads/*.jpeg /wp-content/uploads/*.png /wp-content/uploads/*.gif
-		not file {path}.webp
-		file {path}
-	}
-	rewrite @webp_needs_convert /index.php?webp_convert={path}
-
-	# Add Vary header for proper caching of WebP vs original
-	header /wp-content/uploads/*.jpg Vary Accept
-	header /wp-content/uploads/*.jpeg Vary Accept
-	header /wp-content/uploads/*.png Vary Accept
-	header /wp-content/uploads/*.gif Vary Accept
-
     @disallowed {
        path /xmlrpc.php
        path *.sql
