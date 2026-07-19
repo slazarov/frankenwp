@@ -1,14 +1,16 @@
 package cache
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"time"
 
+	"github.com/maypok86/otter/v2"
 	"go.uber.org/zap"
 )
 
@@ -24,15 +26,48 @@ var (
 	}
 )
 
+const (
+	CACHE_DIR = "sidekick-cache"
+	// keySep separates the path component of a cache key from the query
+	// variant, and the variant from the content-encoding. It is intentionally
+	// a token that cannot appear inside a sanitized single path segment so
+	// that a prefix purge on "<path>::" is segment-exact.
+	keySep = "::"
+)
+
+// Store is a two-tier full-page cache: an in-memory Otter cache (adaptive
+// W-TinyLFU, weight-bounded) backed by an on-disk store under <loc>/sidekick-cache.
 type Store struct {
 	loc    string
 	ttl    int
 	logger *zap.Logger
-	// memCach0 atomic.Value // *xsync.MapOf[string, *MemCacheItem]
 
 	memMaxSize  int
 	memMaxCount int
-	memCache    atomic.Value // *LRUCache[string, *MemCacheItem]
+
+	mem *otter.Cache[string, *MemCacheItem]
+
+	// diskMu serializes bulk disk removal (Purge/Flush, write-lock) against
+	// individual entry writes/reads (Set / disk load, read-lock) so a
+	// RemoveAll never races a WriteFile on the same directory.
+	diskMu sync.RWMutex
+
+	// populating dedups concurrent live-miss writers for the same page variant
+	// so only one CustomWriter stores the response; followers serve the origin
+	// but skip the write. Keyed by dirKey (path::variant).
+	populating sync.Map
+}
+
+// tryLeadPopulation returns true for the first caller for a dirKey (the leader,
+// which will store the response). Concurrent callers get false until the leader
+// calls donePopulation.
+func (d *Store) tryLeadPopulation(dirKey string) bool {
+	_, loaded := d.populating.LoadOrStore(dirKey, struct{}{})
+	return !loaded
+}
+
+func (d *Store) donePopulation(dirKey string) {
+	d.populating.Delete(dirKey)
 }
 
 type MemCacheItem struct {
@@ -40,276 +75,268 @@ type MemCacheItem struct {
 	value []byte
 }
 
-const (
-	CACHE_DIR = "sidekick-cache"
-)
+// NewStore builds the store and eagerly creates the cache directory, returning
+// an error if it is not creatable/writable so Provision can fail fast.
+func NewStore(loc string, ttl int, memMaxSize int, memMaxCount int, logger *zap.Logger) (*Store, error) {
+	if loc == "" {
+		return nil, errors.New("wp_cache: cache location (loc/CACHE_LOC) is empty")
+	}
+	if err := os.MkdirAll(path.Join(loc, CACHE_DIR), 0o755); err != nil {
+		return nil, fmt.Errorf("wp_cache: cannot create cache dir %q: %w", path.Join(loc, CACHE_DIR), err)
+	}
 
-func NewStore(loc string, ttl int, memMaxSize int, memMaxCount int, logger *zap.Logger) *Store {
-	os.MkdirAll(loc+"/"+CACHE_DIR, 0o755)
-	// memCache := xsync.NewMapOf[*MemCacheItem]()
 	d := &Store{
-		loc:    loc,
-		ttl:    ttl,
-		logger: logger,
-
+		loc:         loc,
+		ttl:         ttl,
+		logger:      logger,
 		memMaxSize:  memMaxSize,
 		memMaxCount: memMaxCount,
 	}
-	memCache := NewLRUCache[string, *MemCacheItem](memMaxCount, memMaxSize)
-	d.memCache.Store(memCache)
 
-	// Load cache from disk
-	/*files, err := os.ReadDir(loc + "/" + CACHE_DIR)
-	if err == nil {
-		for _, file := range files {
-			if file.IsDir() {
-				filename := file.Name()
-				pageFiles, err := os.ReadDir(loc + "/" + CACHE_DIR + "/" + filename)
-				if err != nil {
-					continue
-				}
-
-				// first time, should not have existing value
-				cacheItem, _ := memCache.LoadOrStore(filename, &MemCacheItem{
-					value:     nil,
-					timestamp: time.Now().Unix(),
-				})
-
-				// TODO: load header, stateCode, timestamp
-				for _, pageFile := range pageFiles {
-					if !pageFile.IsDir() {
-						value, err := os.ReadFile(loc + "/" + CACHE_DIR + "/" + file.Name() + "/" + pageFile.Name())
-
-						if err != nil {
-							continue
-						}
-						cacheItem.value = append(cacheItem.value, value...)
-					}
-				}
+	opts := &otter.Options[string, *MemCacheItem]{
+		// Bound the memory tier by total bytes (key + value). Otter uses a
+		// single bound; memory_max_count now only seeds the initial capacity.
+		MaximumWeight: uint64(memMaxSize),
+		Weigher: func(key string, value *MemCacheItem) uint32 {
+			if value == nil {
+				return uint32(len(key))
 			}
-		}
-	}*/
+			return uint32(len(key) + len(value.value))
+		},
+	}
+	if memMaxCount > 0 {
+		opts.InitialCapacity = memMaxCount
+	}
+	if ttl > 0 {
+		// Backstop bound on how long a memory entry may live; the authoritative
+		// TTL check is done on read against CacheMeta.Timestamp.
+		opts.ExpiryCalculator = otter.ExpiryWriting[string, *MemCacheItem](time.Duration(ttl) * time.Second)
+	}
 
-	return d
+	c, err := otter.New(opts)
+	if err != nil {
+		return nil, fmt.Errorf("wp_cache: init memory cache: %w", err)
+	}
+	d.mem = c
+
+	return d, nil
 }
 
-// func (d *Store) getMemCache() *xsync.MapOf[string, *MemCacheItem] {
-// 	memCache, ok := d.memCache.Load().(*xsync.MapOf[string, *MemCacheItem])
-// 	if !ok {
-// 		return nil
-// 	}
-// 	return memCache
-// }
-
-func (d *Store) getMemCache() *LRUCache[string, *MemCacheItem] {
-	memCache, ok := d.memCache.Load().(*LRUCache[string, *MemCacheItem])
-	if !ok {
-		return nil
-	}
-	return memCache
+// pathKey sanitizes a request path into a single filesystem-safe token.
+func (d *Store) pathKey(reqPath string) string {
+	return strings.ReplaceAll(reqPath, "/", "+")
 }
 
-func (d *Store) Get(key string, ce string) ([]byte, *CacheMeta, error) {
-	key = strings.ReplaceAll(key, "/", "+")
-	d.logger.Debug("Getting key from cache", zap.String("key", key), zap.String("ce", ce))
+// dirKey is the on-disk directory name / memory key prefix for a page variant.
+func (d *Store) dirKey(reqPath, variant string) string {
+	return d.pathKey(reqPath) + keySep + variant
+}
 
-	memCache := d.getMemCache()
+// Get returns the cached body + meta for a page variant and encoding, loading
+// from disk on a memory miss. Concurrent loads of the same key are coalesced by
+// Otter. An expired entry (per CacheMeta.Timestamp) is reported as a miss.
+func (d *Store) Get(ctx context.Context, reqPath, variant, ce string) ([]byte, *CacheMeta, error) {
+	dirKey := d.dirKey(reqPath, variant)
+	otterKey := dirKey + keySep + ce
 
-	// load from memory or try load from disk
-	var retErr error
-	var cacheItem *MemCacheItem
-	isDisk := false
-	cacheKey := key + "::" + ce
-	for cacheItem == nil && retErr == nil {
-		// not sure why compute function may get called more than once...?
-		cacheItem, _ = memCache.LoadOrCompute(cacheKey, func() (*MemCacheItem, int, bool) {
-			// test for disable load from disk
-			// retErr = ErrCacheNotFound
-			// return nil, 0, false
-
-			cacheMeta := &CacheMeta{}
-			err := cacheMeta.LoadFromFile(path.Join(d.loc, CACHE_DIR, key, ".meta"))
-			if err != nil {
-				retErr = err
-				return nil, 0, false
-			}
-			value, err := os.ReadFile(path.Join(d.loc, CACHE_DIR, key, "."+ce))
-			if err != nil {
-				retErr = err
-				return nil, 0, false
-			}
-
-			isDisk = true
-			return &MemCacheItem{
-				CacheMeta: cacheMeta,
-				value:     value,
-			}, len(value), true // TODO: add header size
-		})
-		if cacheItem == nil {
-			memCache.Delete(cacheKey)
-		}
-	}
-	if retErr != nil {
-		d.logger.Debug("Error pulled key from disk", zap.String("key", key), zap.String("ce", ce), zap.Error(retErr))
+	item, err := d.mem.Get(ctx, otterKey, otter.LoaderFunc[string, *MemCacheItem](
+		func(ctx context.Context, _ string) (*MemCacheItem, error) {
+			return d.loadFromDisk(dirKey, ce)
+		},
+	))
+	if err != nil || item == nil {
 		return nil, nil, ErrCacheNotFound
 	}
 
-	if isDisk {
-		d.logger.Debug("Pulled key from disk", zap.String("key", key), zap.String("ce", ce))
-	} else {
-		d.logger.Debug("Pulled key from memory", zap.String("key", key), zap.String("ce", ce))
+	if d.expired(item.CacheMeta) {
+		d.mem.Invalidate(otterKey)
+		return nil, nil, ErrCacheExpired
 	}
 
-	if d.ttl > 0 {
-		if time.Now().Unix() > cacheItem.Timestamp+int64(d.ttl) {
-			d.logger.Debug("Cache expired", zap.String("key", key))
-			// TODO: fix racing when purge running and setting new value with same key
-			go d.Purge(key)
-			return nil, nil, ErrCacheExpired
+	return item.value, item.CacheMeta, nil
+}
+
+func (d *Store) expired(meta *CacheMeta) bool {
+	return d.ttl > 0 && meta != nil && time.Now().Unix() > meta.Timestamp+int64(d.ttl)
+}
+
+func (d *Store) loadFromDisk(dirKey, ce string) (*MemCacheItem, error) {
+	d.diskMu.RLock()
+	defer d.diskMu.RUnlock()
+
+	base := path.Join(d.loc, CACHE_DIR, dirKey)
+
+	meta := &CacheMeta{}
+	if err := meta.LoadFromFile(path.Join(base, ".meta."+ce)); err != nil {
+		// Backward-compat: caches written before per-encoding meta used a
+		// single shared ".meta". Fall back once; new writes are per-encoding.
+		if err2 := meta.LoadFromFile(path.Join(base, ".meta")); err2 != nil {
+			return nil, ErrCacheNotFound
 		}
 	}
 
-	d.logger.Debug("Cache hit", zap.String("key", key), zap.String("ce", ce))
-	return cacheItem.value, cacheItem.CacheMeta, nil
+	value, err := os.ReadFile(path.Join(base, "."+ce))
+	if err != nil {
+		return nil, ErrCacheNotFound
+	}
+
+	if d.expired(meta) {
+		return nil, ErrCacheExpired
+	}
+
+	meta.contentEncoding = ce
+	return &MemCacheItem{CacheMeta: meta, value: value}, nil
 }
 
-func (d *Store) Set(reqPath string, cacheKey string, meta *CacheMeta, value []byte) error {
-	key := d.buildCacheKey(reqPath, cacheKey)
-	d.logger.Debug("Cache Key", zap.String("Key", key), zap.String("ce", meta.contentEncoding))
+// Peek returns the current cached meta for a variant/encoding without loading
+// from disk or affecting recency; used to carry validators across recache.
+func (d *Store) Peek(reqPath, variant, ce string) (*CacheMeta, bool) {
+	otterKey := d.dirKey(reqPath, variant) + keySep + ce
+	item, ok := d.mem.GetIfPresent(otterKey)
+	if !ok || item == nil {
+		return nil, false
+	}
+	return item.CacheMeta, true
+}
 
-	key = strings.ReplaceAll(key, "/", "+")
+// Set stores a page variant/encoding into memory and disk. Body is written
+// before meta, both atomically (temp file + rename), so a reader never pairs a
+// fresh meta with a short/missing body.
+func (d *Store) Set(reqPath, variant string, meta *CacheMeta, value []byte) error {
+	dirKey := d.dirKey(reqPath, variant)
 	ce := meta.contentEncoding
-	memCache := d.getMemCache()
-	// _, existed := memCache.LoadAndStore(key+"::"+ce, &MemCacheItem{
-	// 	CacheMeta: meta,
-	// 	value:     value,
-	// })
-	existed := memCache.Put(key+"::"+ce, &MemCacheItem{
-		CacheMeta: meta,
-		value:     value,
-	}, len(value)) // TODO: add header size
+	otterKey := dirKey + keySep + ce
 
-	d.logger.Debug("-----------------------------------")
-	d.logger.Debug("Setting key in cache", zap.String("key", key), zap.String("ce", meta.contentEncoding), zap.Bool("replace", existed))
+	d.mem.Set(otterKey, &MemCacheItem{CacheMeta: meta, value: value})
 
-	// create page directory
-	basePath := path.Join(d.loc, CACHE_DIR, key)
-	os.MkdirAll(basePath, 0o755)
-	err := os.WriteFile(path.Join(basePath, "."+ce), value, 0o644)
-	if err != nil {
-		d.logger.Error("Error writing data to cache", zap.Error(err))
+	d.diskMu.RLock()
+	defer d.diskMu.RUnlock()
+
+	base := path.Join(d.loc, CACHE_DIR, dirKey)
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		return err
 	}
-	err = meta.WriteToFile(path.Join(basePath, ".meta"))
-	if err != nil {
-		d.logger.Error("Error writing meta to cache", zap.Error(err))
+
+	var errs []error
+	if err := writeFileAtomic(path.Join(base, "."+ce), value, 0o644); err != nil {
+		errs = append(errs, fmt.Errorf("write body: %w", err))
 	}
-	return nil
+	if err := meta.WriteToFileAtomic(path.Join(base, ".meta."+ce)); err != nil {
+		errs = append(errs, fmt.Errorf("write meta: %w", err))
+	}
+	return errors.Join(errs...)
 }
 
-func (d *Store) Purge(key string) {
-	key = strings.ReplaceAll(key, "/", "+")
-	d.logger.Debug("Removing key from cache", zap.String("key", key))
+// Purge removes a single page (all query variants + encodings) from memory and
+// disk. The match is segment-exact: purging "/post" never removes "/post-2".
+func (d *Store) Purge(reqPath string) {
+	prefix := d.pathKey(reqPath) + keySep
 
-	memCache := d.getMemCache()
-	rmKeys := make([]string, 0, 4)
-	memCache.Range(func(k string, v *MemCacheItem) bool {
-		if strings.HasPrefix(k, key) {
-			rmKeys = append(rmKeys, k)
+	for k := range d.mem.All() {
+		if strings.HasPrefix(k, prefix) {
+			d.mem.Invalidate(k)
 		}
-		return true
-	})
-	for _, k := range rmKeys {
-		d.logger.Debug("Removing key from mem cache", zap.String("key", k))
-		memCache.Delete(k)
 	}
 
-	basePath := path.Join(d.loc, CACHE_DIR)
-	files, err := os.ReadDir(basePath)
+	d.diskMu.Lock()
+	defer d.diskMu.Unlock()
+
+	base := path.Join(d.loc, CACHE_DIR)
+	files, err := os.ReadDir(base)
 	if err != nil {
-		d.logger.Error("Error Removing key from disk cache", zap.Error(err))
+		d.logger.Error("wp_cache: purge readdir", zap.Error(err))
 		return
 	}
 	for _, f := range files {
-		name := f.Name()
-		if !strings.HasPrefix(name, key) {
+		if !strings.HasPrefix(f.Name(), prefix) {
 			continue
 		}
-		fp := path.Join(basePath, name)
-		err := os.RemoveAll(fp)
-		if err != nil {
-			d.logger.Error("Error Removing key from disk cache", zap.String("fp", fp), zap.Error(err))
+		fp := path.Join(base, f.Name())
+		if err := os.RemoveAll(fp); err != nil {
+			d.logger.Error("wp_cache: purge remove", zap.String("fp", fp), zap.Error(err))
 		}
-		// for _, name := range CachedContentEncoding {
-		// 	err := os.Remove(path.Join(fp, "."+name))
-		// 	if err != nil {
-		// 		d.logger.Error("Error Removing key from disk cache", zap.String("fp", fp), zap.Error(err))
-		// 	}
-		// }
 	}
 }
 
+// Flush empties the entire cache (memory + disk).
 func (d *Store) Flush() error {
-	d.memCache.Store(NewLRUCache[string, *MemCacheItem](d.memMaxCount, d.memMaxSize))
-	// return nil
-	basePath := path.Join(d.loc, CACHE_DIR)
-	files, err := os.ReadDir(basePath)
+	d.mem.InvalidateAll()
+
+	d.diskMu.Lock()
+	defer d.diskMu.Unlock()
+
+	base := path.Join(d.loc, CACHE_DIR)
+	files, err := os.ReadDir(base)
 	if err != nil {
-		d.logger.Error("Error flushing cache", zap.Error(err))
+		d.logger.Error("wp_cache: flush readdir", zap.Error(err))
 		return err
 	}
+	var errs []error
 	for _, f := range files {
-		fp := path.Join(basePath, f.Name())
-		err = os.RemoveAll(fp)
-		if err != nil {
-			d.logger.Error("Error flushing cache", zap.String("fp", fp), zap.Error(err))
+		fp := path.Join(base, f.Name())
+		if err := os.RemoveAll(fp); err != nil {
+			errs = append(errs, err)
+			d.logger.Error("wp_cache: flush remove", zap.String("fp", fp), zap.Error(err))
 		}
 	}
-	return err
+	return errors.Join(errs...)
 }
 
+// List enumerates the cache contents (used by the authenticated purge GET).
 func (d *Store) List() map[string][]string {
-	memCache := d.getMemCache()
-	list := make(map[string][]string)
-	list["mem"] = make([]string, 0, memCache.Size())
+	list := map[string][]string{
+		"mem":  {},
+		"disk": {},
+	}
 
-	memCache.Range(func(key string, value *MemCacheItem) bool {
-		list["mem"] = append(list["mem"], key)
-		return true
-	})
+	for k := range d.mem.All() {
+		list["mem"] = append(list["mem"], k)
+	}
 
-	basePath := path.Join(d.loc, CACHE_DIR)
-	files, err := os.ReadDir(basePath)
-	list["disk"] = make([]string, 0)
-
-	if err == nil {
+	base := path.Join(d.loc, CACHE_DIR)
+	if files, err := os.ReadDir(base); err == nil {
 		for _, file := range files {
 			if !file.IsDir() {
 				continue
 			}
-			dirName := file.Name()
-			fp := path.Join(basePath, dirName)
 			for _, name := range CachedContentEncoding {
-				ckPath := path.Join(fp, "."+name)
-				_, err := os.Stat(ckPath)
-				if errors.Is(err, os.ErrNotExist) {
-					continue
+				if _, err := os.Stat(path.Join(base, file.Name(), "."+name)); err == nil {
+					list["disk"] = append(list["disk"], file.Name()+keySep+name)
 				}
-				list["disk"] = append(list["disk"], dirName+"::"+name)
 			}
 		}
 	}
 
 	list["debug"] = []string{
-		fmt.Sprintf("max_size=%v", d.memMaxSize),
-		fmt.Sprintf("max_count=%v", d.memMaxCount),
-		fmt.Sprintf("size=%v", memCache.Cost()),
-		fmt.Sprintf("coun=%v", memCache.Size()),
+		fmt.Sprintf("max_weight=%d", d.memMaxSize),
+		fmt.Sprintf("weighted_size=%d", d.mem.WeightedSize()),
+		fmt.Sprintf("count=%d", d.mem.EstimatedSize()),
 	}
 
 	return list
 }
 
-func (d *Store) buildCacheKey(reqPath string, cacheKey string) string {
-	// cacheKey := contentEncoding + "::" + reqPath
-	return fmt.Sprintf("%v::%v", reqPath, cacheKey)
+// writeFileAtomic writes data to fp via a temp file in the same directory
+// followed by an atomic rename.
+func writeFileAtomic(fp string, data []byte, perm os.FileMode) error {
+	dir := path.Dir(fp)
+	tmp, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op after a successful rename
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, fp)
 }
