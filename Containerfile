@@ -71,17 +71,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libmemcached-dev \
     zlib1g-dev \
     libnss3-tools \
-    && install-php-extensions \
+    # install-php-extensions is idempotent; retry to ride out transient
+    # pecl.php.net / GitHub 5xx outages instead of failing the whole build.
+    # imagick from master: https://github.com/Imagick/imagick/issues/640#issuecomment-2077206945
+    && n=0; until install-php-extensions \
     bcmath \
     exif \
     gd \
     intl \
     mysqli \
     zip \
-    # See https://github.com/Imagick/imagick/issues/640#issuecomment-2077206945
     imagick/imagick@master \
     opcache \
-    redis \
+    redis; do \
+    n=$((n+1)); \
+    if [ "$n" -ge 5 ]; then echo "install-php-extensions failed after $n attempts" >&2; exit 1; fi; \
+    echo "install-php-extensions attempt $n failed; retrying in 15s..." >&2; sleep 15; \
+    done \
     && cp $PHP_INI_DIR/php.ini-production $PHP_INI_DIR/php.ini \
     && apt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false \
     && apt-get clean \
