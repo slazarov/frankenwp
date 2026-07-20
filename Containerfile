@@ -111,7 +111,9 @@ RUN mkdir -p /var/www/html/wp-content/cache \
 # Declare volume after preparing directories
 VOLUME /var/www/html/wp-content
 
-COPY Caddyfile /etc/caddy/Caddyfile
+# Force 0644 so the config is always world-readable regardless of the build
+# host's umask/source perms — frankenphp runs as www-data and must read it.
+COPY --chmod=644 Caddyfile /etc/caddy/Caddyfile
 
 # Re-declare here: a global ARG (before the first FROM) is not expanded inside a
 # build stage unless re-declared. Without this, ${USER} is empty and the image
