@@ -16,9 +16,9 @@ jobs:
       run:
         working-directory: sidekick/middleware/cache
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: "1.26"
           cache-dependency-path: sidekick/middleware/cache/go.sum
@@ -35,7 +35,7 @@ jobs:
           govulncheck ./...
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v8
         with:
           version: latest
           working-directory: sidekick/middleware/cache
@@ -44,7 +44,7 @@ jobs:
     name: PHP lint (mu-plugins)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: shivammathur/setup-php@v2
         with:
           php-version: "8.4"
@@ -57,7 +57,7 @@ jobs:
     name: Dockerfile lint (hadolint)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: Containerfile
