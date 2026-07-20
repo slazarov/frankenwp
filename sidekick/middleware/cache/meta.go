@@ -221,6 +221,6 @@ func (m *CacheMeta) LoadFromFile(fp string) error {
 	if err != nil {
 		return err
 	}
-	defer fd.Close()
+	defer func() { _ = fd.Close() }()
 	return json.NewDecoder(fd).Decode(m)
 }

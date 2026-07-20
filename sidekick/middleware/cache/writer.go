@@ -101,7 +101,7 @@ func (r *CustomWriter) WriteHeader(status int) {
 	if cacheable {
 		if forbid, reason := responseForbidsCache(hdr); forbid {
 			cacheable = false
-			r.Logger.Debug("wp cache - bypass response semantics", zap.String("reason", reason))
+			r.Debug("wp cache - bypass response semantics", zap.String("reason", reason))
 		}
 	}
 
@@ -115,8 +115,8 @@ func (r *CustomWriter) WriteHeader(status int) {
 
 	// Elect a single leader to populate this page variant; followers still
 	// serve the origin response but do not write to the cache.
-	dirKey := r.Store.dirKey(r.reqPath, r.variant)
-	if r.Store.tryLeadPopulation(dirKey) {
+	dirKey := r.dirKey(r.reqPath, r.variant)
+	if r.tryLeadPopulation(dirKey) {
 		r.leader = true
 		atomic.StoreInt32(&r.needCache, 1)
 	}
@@ -136,7 +136,7 @@ func (r *CustomWriter) Write(b []byte) (int, error) {
 		} else {
 			atomic.StoreInt32(&r.needCache, 0)
 			r.buf = nil
-			r.Logger.Debug("wp cache - bypass size", zap.Int("limit", r.cacheMaxSize))
+			r.Debug("wp cache - bypass size", zap.Int("limit", r.cacheMaxSize))
 		}
 	}
 
@@ -149,7 +149,7 @@ func (r *CustomWriter) Close() error {
 	if !r.leader {
 		return nil
 	}
-	defer r.Store.donePopulation(r.Store.dirKey(r.reqPath, r.variant))
+	defer r.donePopulation(r.dirKey(r.reqPath, r.variant))
 
 	if atomic.LoadInt32(&r.needCache) != 1 {
 		return nil
@@ -160,14 +160,14 @@ func (r *CustomWriter) Close() error {
 	if ce == "" {
 		ce = "none"
 	}
-	prev, _ := r.Store.Peek(r.reqPath, r.variant, ce)
+	prev, _ := r.Peek(r.reqPath, r.variant, ce)
 
 	meta := NewCacheMeta(int(atomic.LoadInt32(&r.status)), hdr, r.buf, prev)
 	if meta == nil {
 		return nil
 	}
-	if err := r.Store.Set(r.reqPath, r.variant, meta, r.buf); err != nil {
-		r.Logger.Error("wp cache - set failed", zap.String("path", r.reqPath), zap.Error(err))
+	if err := r.Set(r.reqPath, r.variant, meta, r.buf); err != nil {
+		r.Error("wp cache - set failed", zap.String("path", r.reqPath), zap.Error(err))
 	}
 	return nil
 }

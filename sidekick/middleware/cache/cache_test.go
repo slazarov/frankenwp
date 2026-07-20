@@ -120,18 +120,18 @@ func TestServeQueryStripVsBypass(t *testing.T) {
 	next := htmlHandler(&calls)
 
 	// Prime the clean page.
-	c.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/", nil), next)
+	_ = c.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/", nil), next)
 
 	// Tracking param is stripped => same cached page => HIT, no new render.
 	wTrack := httptest.NewRecorder()
-	c.ServeHTTP(wTrack, httptest.NewRequest("GET", "/?fbclid=xyz", nil), next)
+	_ = c.ServeHTTP(wTrack, httptest.NewRequest("GET", "/?fbclid=xyz", nil), next)
 	if got := wTrack.Header().Get("X-Cache"); got != "HIT" {
 		t.Fatalf("tracking-param X-Cache = %q, want HIT", got)
 	}
 
 	// Real query => bypass in strip mode.
 	wQuery := httptest.NewRecorder()
-	c.ServeHTTP(wQuery, httptest.NewRequest("GET", "/?s=secret", nil), next)
+	_ = c.ServeHTTP(wQuery, httptest.NewRequest("GET", "/?s=secret", nil), next)
 	if got := wQuery.Header().Get("X-Cache"); got != "BYPASS" {
 		t.Fatalf("query X-Cache = %q, want BYPASS", got)
 	}
@@ -200,9 +200,9 @@ func TestConditional304(t *testing.T) {
 	next := htmlHandler(&calls)
 
 	// Prime + read the ETag from a HIT.
-	c.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/", nil), next)
+	_ = c.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/", nil), next)
 	wHit := httptest.NewRecorder()
-	c.ServeHTTP(wHit, httptest.NewRequest("GET", "/", nil), next)
+	_ = c.ServeHTTP(wHit, httptest.NewRequest("GET", "/", nil), next)
 	etag := wHit.Header().Get("Etag")
 	if etag == "" {
 		t.Fatal("no ETag on hit")

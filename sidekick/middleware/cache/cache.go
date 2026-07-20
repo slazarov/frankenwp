@@ -523,7 +523,7 @@ func (c *Cache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp
 
 	recordEvent("miss")
 	nw := NewCustomWriter(w, r, db, c.logger, c, variant)
-	defer nw.Close()
+	defer func() { _ = nw.Close() }()
 	return next.ServeHTTP(nw, r)
 }
 
@@ -577,7 +577,7 @@ func (c *Cache) doCache(r0 *http.Request, next caddyhttp.Handler, variant string
 	r = caddyhttp.PrepareRequest(r, repl, nil, nil)
 
 	nw := NewCustomWriter(&NopResponseWriter{}, r, c.Store, c.logger, c, variant)
-	defer nw.Close()
+	defer func() { _ = nw.Close() }()
 	_ = next.ServeHTTP(nw, r)
 }
 
