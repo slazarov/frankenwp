@@ -59,35 +59,3 @@ func TestCacheableStatus(t *testing.T) {
 		t.Fatalf("500 should not be cacheable when only 503 is listed")
 	}
 }
-
-func TestShouldBypassCacheForContent(t *testing.T) {
-	cases := []struct {
-		name    string
-		content string
-		bypass  bool
-	}{
-		{"iubenda activate", `<iframe class="_iub_cs_activate" src="about:blank"></iframe>`, true},
-		{"cmp lazyload", `<iframe class="cmplazyload" src="about:blank"></iframe>`, true},
-		{"suppressed src", `<iframe data-suppressedsrc="https://maps.google.com"></iframe>`, true},
-		{
-			"real-world suppressed maps iframe",
-			`<iframe src="about:blank" loading="lazy" class="_iub_cs_activate cmplazyload" ` +
-				`data-suppressedsrc="https://www.google.com/maps/embed?pb=x" data-cmp-vendor="178"></iframe>`,
-			true,
-		},
-		// Broad consent-banner signals that load site-wide must NOT bypass the
-		// cache, otherwise caching is disabled for every page on the site.
-		{"cookiebot banner", `<script src="https://consent.cookiebot.com/uc.js"></script>`, false},
-		{"onetrust banner", `<script src="https://cdn.onetrust.com/OneTrust.js"></script>`, false},
-		{"generic cookieconsent", `<div class="CookieConsent"></div>`, false},
-		{"normal youtube embed", `<iframe src="https://www.youtube.com/embed/test"></iframe>`, false},
-		{"plain html", `<html><body><h1>Hello</h1></body></html>`, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := shouldBypassCacheForContent([]byte(tc.content)); got != tc.bypass {
-				t.Fatalf("shouldBypassCacheForContent(%q) = %v, want %v", tc.name, got, tc.bypass)
-			}
-		})
-	}
-}

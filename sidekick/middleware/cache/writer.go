@@ -1,7 +1,6 @@
 package cache
 
 import (
-	"bytes"
 	"net/http"
 	"slices"
 	"strconv"
@@ -144,35 +143,6 @@ func (r *CustomWriter) Write(b []byte) (int, error) {
 	return r.ResponseWriter.Write(b)
 }
 
-// consentSuppressedMarkers are byte patterns that indicate a page carries a
-// consent-suppressed / lazy-activated embed (e.g. a Google Maps iframe held at
-// src="about:blank" until the visitor's consent JS swaps in data-suppressedsrc).
-// Such pages depend on per-visitor client-side activation and must not be
-// stored in the shared full-page cache.
-//
-// These markers are deliberately narrow: they appear only on pages that
-// actually contain a suppressed embed, not on every page. Broad consent-banner
-// signals (Cookiebot, OneTrust, generic "CookieConsent", etc.) are intentionally
-// excluded because those scripts load site-wide and matching them would disable
-// caching for the entire site.
-var consentSuppressedMarkers = [][]byte{
-	[]byte("data-suppressedsrc"), // CMP-suppressed iframe source (Iubenda, etc.)
-	[]byte("_iub_cs_activate"),   // Iubenda consent activation hook
-	[]byte("cmplazyload"),        // CMP lazy-load activation class
-}
-
-// shouldBypassCacheForContent reports whether the buffered response body carries
-// a consent-suppressed embed that requires per-visitor client-side activation
-// and therefore must not be cached.
-func shouldBypassCacheForContent(content []byte) bool {
-	for _, marker := range consentSuppressedMarkers {
-		if bytes.Contains(content, marker) {
-			return true
-		}
-	}
-	return false
-}
-
 // Close stores the buffered response (leader only) and releases the population
 // slot. Safe to call when nothing was cached.
 func (r *CustomWriter) Close() error {
@@ -182,11 +152,6 @@ func (r *CustomWriter) Close() error {
 	defer r.donePopulation(r.dirKey(r.reqPath, r.variant))
 
 	if atomic.LoadInt32(&r.needCache) != 1 {
-		return nil
-	}
-
-	if shouldBypassCacheForContent(r.buf) {
-		r.Debug("wp cache - bypass consent-suppressed embed", zap.String("path", r.reqPath))
 		return nil
 	}
 
