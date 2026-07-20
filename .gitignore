@@ -1,2 +1,11 @@
 .tmp
 .air.toml
+
+# Local environment / secrets
+.env
+.env.*
+!.env.example
+
+# Local cache & build artifacts
+wp-content/cache/
+**/sidekick-cache/

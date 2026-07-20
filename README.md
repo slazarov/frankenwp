@@ -24,37 +24,73 @@ An enterprise-grade WordPress image built for scale. It uses the new FrankenPHP 
 
 ### Caching
 
-- opcache
-- Internal server sidekick
+- **OPcache + JIT** for PHP.
+- **Sidekick full-page cache** — a custom Caddy handler (`wp_cache`) that stores rendered pages in a two-tier memory ([Otter](https://github.com/maypok86/otter) W-TinyLFU) + disk cache, shareable across containers. See [`sidekick/middleware/cache/README.md`](./sidekick/middleware/cache/README.md) for the full design.
+- Optional **Cloudflare** edge purging via `Cache-Tag`.
+
+Every response carries a status header (`X-FrankenWP-Cache` by default) with one of: `HIT`, `HIT-304`, `MISS`, `BYPASS`.
+
+### Cache behavior (summary)
+
+- Only anonymous `GET` responses with a cacheable status are stored.
+- **Never cached:** logged-in requests (`wordpress_logged_in*` cookie), or responses with `Set-Cookie`, `Cache-Control: private/no-store/no-cache`, or `Vary: Cookie` — so personalized pages are never served to other users.
+- **Query strings** (`QUERY_MODE`): `strip` (default) drops tracking params (`utm_*`, `fbclid`, `gclid`, …) so those URLs hit the clean cached page, then bypasses any request that still has a query; `include` keys on the normalized query instead.
+- Conditional requests (`If-None-Match` / `If-Modified-Since`) return `304`.
+- The purge API **fails closed**: it is disabled unless `PURGE_KEY` is set, and the key is compared in constant time.
+
+### Purge API
+
+- `POST {PURGE_PATH}/<relative-path>` with header `{PURGE_KEY_HEADER}: {PURGE_KEY}` purges that page (all query variants + encodings, segment-exact).
+- `POST {PURGE_PATH}/` (empty path) flushes the entire cache.
+- `GET {PURGE_PATH}` returns the current cache listing (also key-gated).
+
+WordPress purges automatically on `save_post` (see `wp-content/mu-plugins/contentCachePurge.php`), and — if `CLOUDFLARE_ZONE_ID`/`CLOUDFLARE_API_TOKEN` are set — purges Cloudflare by `Cache-Tag`.
 
 ### Environment Variables
 
 #### FrankenPHP
 
-- `SERVER_NAME`: change the addresses on which to listen, the provided hostnames will also be used for the generated TLS certificate
-- `CADDY_GLOBAL_OPTIONS`: inject global options (debug most common)
-- `FRANKENPHP_CONFIG`: inject config under the frankenphp directive
+- `SERVER_NAME`: addresses to listen on; also used for the generated TLS cert.
+- `CADDY_GLOBAL_OPTIONS`: inject global Caddy options.
+- `FRANKENPHP_CONFIG`: inject config under the `frankenphp` directive.
 
 #### Sidekick Cache
 
-- `CACHE_LOC`: Where to store cache. Defaults to /var/www/html/wp-content/cache
-- `CACHE_RESPONSE_CODES`: Which status codes to cache. Defaults to 200,404,405
-- `BYPASS_PATH_PREFIX`: Which path prefixes to not cache. Defaults to /wp-admin,/wp-json
-- `BYPASS_HOME`: Whether to skip caching home. Defaults to false.
-- `PURGE_KEY`: Create a purge key that must be validated on purge requests. Helps to prevent malicious intent. No default.
-- `PURGE_PATH`: Create a custom route for the cache purge API path. Defaults to /\_\_cache/purge.
-- `TTL`: Defines how long objects should be stored in cache. Defaults to 6000.
+- `CACHE_LOC`: where to store cache. Default `/var/www/html/wp-content/cache`.
+- `CACHE_RESPONSE_CODES`: status codes to cache (`200,404,405`). `000` disables caching. A bare `5XX` wildcard never caches; list exact 5xx codes to opt in.
+- `TTL`: seconds to keep objects. Default `6000` (`0` = no expiry).
+- `QUERY_MODE`: `strip` (default) or `include` — see above.
+- `BYPASS_PATH_PREFIXES`: comma-separated path prefixes to never cache. Default `/wp-admin,/wp-json,/wp-login.php`.
+- `BYPASS_HOME`: skip caching the home page. Default `false`.
+- `BYPASS_DEBUG_QUERY`: query param that forces a bypass. Default `WPEverywhere-NOCACHE`.
+- `PURGE_KEY`: **required to enable** the purge/flush endpoint (fails closed when empty). No default.
+- `PURGE_KEY_HEADER`: header carrying the key. Default `X-WPSidekick-Purge-Key`.
+- `PURGE_PATH`: purge API route. Default `/__cache/purge`.
+- `CACHE_HEADER_NAME`: cache-status response header. Default `X-FrankenWP-Cache`.
+- `CACHE_MEM_ITEM_SIZE` / `CACHE_MEM_ALL_SIZE` / `CACHE_MEM_ALL_COUNT`: per-item byte cap, total memory byte cap, and initial capacity hint.
 
-#### Wordpress
+#### Cloudflare (optional)
 
-- `DB_NAME`: The WordPress database name.
-- `DB_USER`: The WordPress database user.
-- `DB_PASSWORD`: The WordPress database password.
-- `DB_HOST`: The WordPress database host.
-- `DB_TABLE_PREFIX`: The WordPress database table prefix.
-- `WP_DEBUG`: Turns on WordPress Debug.
-- `FORCE_HTTPS`: Tells WordPress to use https on requests. This is beneficial behind load balancer. Defaults to true.
-- `WORDPRESS_CONFIG_EXTRA`: use this for adding WP_HOME, WP_SITEURL, etc
+- `CLOUDFLARE_ZONE_ID` and `CLOUDFLARE_API_TOKEN` (token needs `Zone → Cache Purge`). When set, `save_post` purges by `Cache-Tag`.
+
+#### WordPress
+
+- `DB_NAME` / `DB_USER` / `DB_PASSWORD` / `DB_HOST` / `DB_TABLE_PREFIX`: database settings.
+- `WP_DEBUG`: turns on WordPress debug.
+- `FORCE_HTTPS`: tell WordPress to treat requests as HTTPS (useful behind a load balancer).
+- `WORDPRESS_CONFIG_EXTRA`: extra `wp-config` (e.g. `WP_HOME`, `WP_SITEURL`).
+- First-run auto-install (optional): `WP_URL`, `WP_TITLE`, `WP_ADMIN`, `WP_ADMIN_EMAIL`, `PLUGINS`.
+
+### Versions
+
+Pinned in `Containerfile` (Renovate keeps them current): FrankenPHP **1.12** · PHP **8.4** · WordPress **6.9** · Caddy **2.11.4**. The image runs as non-root `www-data` and builds for `linux/amd64,linux/arm64`.
+
+### Upgrading (breaking changes)
+
+- The cache-status header is now `X-FrankenWP-Cache` (was `X-Custom-Cache` / `X-WPEverywhere-Cache`). Override with `CACHE_HEADER_NAME`.
+- Env var is `BYPASS_PATH_PREFIXES` (plural).
+- The purge endpoint is **disabled unless `PURGE_KEY` is set** — set a strong key (`openssl rand -hex 32`) to keep purge-on-publish working.
+- Example `CACHE_RESPONSE_CODES` is now `200,404,405` (was `000`, which disabled caching).
 
 ## Questions
 

@@ -2,21 +2,36 @@ package cache
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
+	"fmt"
 	"math"
+	"net/http"
+	"net/url"
 	"os"
+	"path"
 	"regexp"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
-
-	"net/http"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"go.uber.org/zap"
+	"golang.org/x/sync/singleflight"
 )
+
+// defaultTrackingParams are query parameters stripped before keying (in
+// query_mode=strip they let a tracking URL still hit the clean cached page).
+var defaultTrackingParams = []string{
+	"gclid", "gclsrc", "dclid", "fbclid", "msclkid", "wbraid", "gbraid",
+	"mc_cid", "mc_eid", "_ga", "_gl", "ref", "igshid", "yclid", "utm_id",
+}
 
 type Cache struct {
 	logger             *zap.Logger
@@ -31,13 +46,18 @@ type Cache struct {
 	BypassDebugQuery   string
 	CacheResponseCodes []string
 	TTL                int
+	QueryMode          string
+	TrackingParams     []string
 	Store              *Store
 
 	MemoryItemMaxSize   int
 	MemoryCacheMaxSize  int
 	MemoryCacheMaxCount int
 
-	pathRx *regexp.Regexp
+	pathRx         *regexp.Regexp
+	trackingParams map[string]struct{}
+	preloadSem     chan struct{}
+	preloadGroup   *singleflight.Group
 }
 
 func init() {
@@ -45,22 +65,18 @@ func init() {
 	httpcaddyfile.RegisterHandlerDirective("wp_cache", parseCaddyfileHandler)
 }
 
-func parseCaddyfileHandler(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler,
-	error) {
+func parseCaddyfileHandler(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	c := new(Cache)
 	if err := c.UnmarshalCaddyfile(h.Dispenser); err != nil {
 		return nil, err
 	}
-
 	return c, nil
 }
 
 func (c *Cache) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
 		var value string
-
 		key := d.Val()
-
 		if !d.Args(&value) {
 			continue
 		}
@@ -75,41 +91,33 @@ func (c *Cache) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		case "bypass_path_regex":
 			value = strings.TrimSpace(value)
 			if len(value) != 0 {
-				_, err := regexp.Compile(value)
-				if err != nil {
-					return err
+				if _, err := regexp.Compile(value); err != nil {
+					return d.Errf("invalid bypass_path_regex %q: %v", value, err)
 				}
 			} else {
-				// bypass all media, images, css, js, etc
 				value = ".*(\\.[^.]+)$"
 			}
 			c.BypassPathRegex = value
 
 		case "bypass_home":
-			if strings.ToLower(value) == "true" {
-				c.BypassHome = true
-			}
+			c.BypassHome = strings.EqualFold(value, "true")
 
 		case "bypass_debug_query":
 			c.BypassDebugQuery = strings.TrimSpace(value)
 
 		case "cache_response_codes":
-			codes := strings.Split(strings.TrimSpace(value), ",")
-			c.CacheResponseCodes = make([]string, len(codes))
+			c.CacheResponseCodes = parseResponseCodes(value)
 
-			for i, code := range codes {
-				code = strings.TrimSpace(code)
-				if strings.Contains(code, "XX") {
-					code = string(code[0])
-				}
-				c.CacheResponseCodes[i] = code
-			}
+		case "query_mode":
+			c.QueryMode = strings.ToLower(strings.TrimSpace(value))
+
+		case "tracking_params":
+			c.TrackingParams = splitCSV(value)
 
 		case "ttl":
-			ttl, err := strconv.Atoi(value)
+			ttl, err := strconv.Atoi(strings.TrimSpace(value))
 			if err != nil {
-				c.logger.Error("Invalid TTL value", zap.Error(err))
-				continue
+				return d.Errf("invalid ttl value %q: %v", value, err)
 			}
 			c.TTL = ttl
 
@@ -129,7 +137,6 @@ func (c *Cache) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			if n, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64); err == nil {
 				c.MemoryItemMaxSize = int(n)
 			}
-
 		case "memory_max_size":
 			if n, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64); err == nil {
 				c.MemoryCacheMaxSize = int(n)
@@ -140,8 +147,30 @@ func (c *Cache) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			}
 		}
 	}
-
 	return nil
+}
+
+func parseResponseCodes(value string) []string {
+	codes := splitCSV(value)
+	out := make([]string, 0, len(codes))
+	for _, code := range codes {
+		if strings.Contains(code, "XX") {
+			code = string(code[0])
+		}
+		out = append(out, code)
+	}
+	return out
+}
+
+func splitCSV(value string) []string {
+	parts := strings.Split(strings.TrimSpace(value), ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func (c *Cache) Provision(ctx caddy.Context) error {
@@ -152,38 +181,24 @@ func (c *Cache) Provision(ctx caddy.Context) error {
 	}
 
 	if c.CacheResponseCodes == nil {
-		codes := strings.Split(os.Getenv("CACHE_RESPONSE_CODES"), ",")
-		c.CacheResponseCodes = make([]string, len(codes))
-
-		for i, code := range codes {
-			code = strings.TrimSpace(code)
-			if strings.Contains(code, "XX") {
-				code = string(code[0])
-			}
-			c.CacheResponseCodes[i] = code
-		}
+		c.CacheResponseCodes = parseResponseCodes(os.Getenv("CACHE_RESPONSE_CODES"))
 	}
 
 	if c.BypassPathPrefixes == nil {
-		c.BypassPathPrefixes = strings.Split(strings.TrimSpace(os.Getenv("BYPASS_PATH_PREFIX")), ",")
+		c.BypassPathPrefixes = splitCSV(os.Getenv("BYPASS_PATH_PREFIXES"))
 	}
 
 	if c.BypassPathRegex == "" {
-		// default bypass all media, images, css, js, etc
 		c.BypassPathRegex = ".*(\\.[^.]+)$"
 	}
-	if c.BypassPathRegex != "" {
-		rx, err := regexp.Compile(c.BypassPathRegex)
-		if err != nil {
-			return err
-		}
-		c.pathRx = rx
+	rx, err := regexp.Compile(c.BypassPathRegex)
+	if err != nil {
+		return err
 	}
+	c.pathRx = rx
 
 	if !c.BypassHome {
-		if strings.ToLower(os.Getenv("BYPASS_HOME")) == "true" {
-			c.BypassHome = true
-		}
+		c.BypassHome = strings.EqualFold(os.Getenv("BYPASS_HOME"), "true")
 	}
 
 	if c.BypassDebugQuery == "" {
@@ -194,23 +209,24 @@ func (c *Cache) Provision(ctx caddy.Context) error {
 	}
 
 	if c.TTL == 0 {
-		ttl, err := strconv.Atoi(os.Getenv("TTL"))
-		if err != nil {
-			c.logger.Error("Invalid TTL value", zap.Error(err))
+		if v := strings.TrimSpace(os.Getenv("TTL")); v != "" {
+			ttl, err := strconv.Atoi(v)
+			if err != nil {
+				return fmt.Errorf("wp_cache: invalid TTL env %q: %w", v, err)
+			}
+			c.TTL = ttl
 		}
-		c.TTL = ttl
 	}
 
 	if c.PurgePath == "" {
 		c.PurgePath = os.Getenv("PURGE_PATH")
-
 		if c.PurgePath == "" {
-			c.PurgePath = "/__wp_cache/purge"
+			c.PurgePath = "/__cache/purge"
 		}
 	}
 
 	if c.PurgeKey == "" {
-		c.PurgeKey = os.Getenv("PURGE_KEY")
+		c.PurgeKey = strings.TrimSpace(os.Getenv("PURGE_KEY"))
 	}
 
 	if c.PurgeKeyHeader == "" {
@@ -223,191 +239,228 @@ func (c *Cache) Provision(ctx caddy.Context) error {
 	if c.CacheHeaderName == "" {
 		c.CacheHeaderName = os.Getenv("CACHE_HEADER_NAME")
 		if c.CacheHeaderName == "" {
-			c.CacheHeaderName = "X-WPEverywhere-Cache"
+			c.CacheHeaderName = "X-FrankenWP-Cache"
 		}
 	}
 
-	// TODO: let 0 == disable memory but cache to disk?
+	if c.QueryMode == "" {
+		c.QueryMode = strings.ToLower(strings.TrimSpace(os.Getenv("QUERY_MODE")))
+		if c.QueryMode == "" {
+			c.QueryMode = "strip"
+		}
+	}
+
+	c.trackingParams = make(map[string]struct{})
+	params := c.TrackingParams
+	if len(params) == 0 {
+		params = defaultTrackingParams
+	}
+	for _, p := range params {
+		c.trackingParams[strings.ToLower(strings.TrimSpace(p))] = struct{}{}
+	}
+
 	if c.MemoryItemMaxSize == 0 {
 		c.MemoryItemMaxSize = 4 * 1024 * 1024 // 4MB
 	}
-	if c.MemoryItemMaxSize < 0 { // < 0 == unlimited
+	if c.MemoryItemMaxSize < 0 {
 		c.MemoryItemMaxSize = math.MaxInt
 	}
-
-	// TODO: let < 0 disable memory but cache to disk?
 	if c.MemoryCacheMaxSize == 0 {
-		c.MemoryCacheMaxSize = 128 * 1024 * 1024 // 128MB as default should be enough?
+		c.MemoryCacheMaxSize = 128 * 1024 * 1024 // 128MB
 	}
-
-	// TODO: let < 0 disable memory but cache to disk?
 	if c.MemoryCacheMaxCount == 0 {
-		c.MemoryCacheMaxCount = 32 * 1024 // 32K item as default should be enough?
+		c.MemoryCacheMaxCount = 32 * 1024 // 32K
 	}
 
-	c.Store = NewStore(c.Loc, c.TTL, c.MemoryCacheMaxSize, c.MemoryCacheMaxCount, c.logger)
+	c.preloadSem = make(chan struct{}, max(2, runtime.GOMAXPROCS(0)))
+	c.preloadGroup = new(singleflight.Group)
+
+	store, err := NewStore(c.Loc, c.TTL, c.MemoryCacheMaxSize, c.MemoryCacheMaxCount, c.logger)
+	if err != nil {
+		return err
+	}
+	c.Store = store
+
+	return nil
+}
+
+func (c *Cache) Validate() error {
+	if c.Store == nil {
+		return fmt.Errorf("wp_cache: store not provisioned")
+	}
+
+	probe := path.Join(c.Loc, CACHE_DIR, ".probe")
+	if err := os.WriteFile(probe, []byte("ok"), 0o644); err != nil {
+		return fmt.Errorf("wp_cache: cache dir %q is not writable: %w", c.Loc, err)
+	}
+	_ = os.Remove(probe)
+
+	if c.PurgeKey == "" {
+		c.logger.Warn("wp_cache: purge_key is empty; the purge/flush endpoint is disabled")
+	}
+
+	for _, code := range c.CacheResponseCodes {
+		if code == "" {
+			continue
+		}
+		if code == "5" {
+			c.logger.Warn("wp_cache: 5xx wildcard is ignored; list exact 5xx codes to cache error pages")
+			continue
+		}
+		for _, ch := range code {
+			if ch < '0' || ch > '9' {
+				return fmt.Errorf("wp_cache: invalid cache_response_code %q", code)
+			}
+		}
+	}
+
+	if c.QueryMode != "strip" && c.QueryMode != "include" {
+		return fmt.Errorf("wp_cache: invalid query_mode %q (want strip or include)", c.QueryMode)
+	}
 
 	return nil
 }
 
 func (Cache) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		ID: "http.handlers.wp_cache",
-		New: func() caddy.Module {
-			return new(Cache)
-		},
+		ID:  "http.handlers.wp_cache",
+		New: func() caddy.Module { return new(Cache) },
 	}
 }
 
-// checkConditionalRequest checks if the request has conditional headers
-// and if the cached content matches those conditions
-// Returns true if content hasn't changed (should return 304)
-func checkConditionalRequest(r *http.Request, cacheMeta *CacheMeta) bool {
-	// Check If-None-Match (ETag validation)
-	ifNoneMatch := r.Header.Get("If-None-Match")
-	if ifNoneMatch != "" {
-		// Extract ETag from cached headers
-		cachedETag := ""
-		for _, kv := range cacheMeta.Header {
-			if len(kv) == 2 && kv[0] == "Etag" {
-				cachedETag = kv[1]
-				break
-			}
+// normalizeQuery derives the query variant for the cache key. In "strip" mode a
+// URL with only tracking params keys to the clean page; any other query bypasses
+// caching. In "include" mode the canonical remaining query is hashed into the key.
+func (c *Cache) normalizeQuery(u *url.URL) (variant string, cacheable bool) {
+	if u.RawQuery == "" {
+		return "", true
+	}
+	q := u.Query()
+	for k := range q {
+		lk := strings.ToLower(k)
+		if strings.HasPrefix(lk, "utm_") {
+			delete(q, k)
+			continue
 		}
+		if _, ok := c.trackingParams[lk]; ok {
+			delete(q, k)
+		}
+	}
+	if len(q) == 0 {
+		return "", true
+	}
+	if c.QueryMode == "include" {
+		for _, vs := range q {
+			sort.Strings(vs)
+		}
+		sum := sha256.Sum256([]byte(q.Encode()))
+		return fmt.Sprintf("q%x", sum[:8]), true
+	}
+	return "", false
+}
 
-		if cachedETag != "" {
-			// Check if ETags match
-			// Support both W/"xxx" and "xxx" formats, and multiple ETags in If-None-Match
-			// Simple string comparison is sufficient for most cases
-			if ifNoneMatch == cachedETag || ifNoneMatch == "*" {
+// checkConditionalRequest implements RFC 7232 precedence: If-None-Match wins and
+// If-Modified-Since is only consulted in its absence. Returns true when a 304 is
+// warranted.
+func checkConditionalRequest(r *http.Request, cacheMeta *CacheMeta) bool {
+	if inm := r.Header.Get("If-None-Match"); inm != "" {
+		cachedETag, ok := cacheMeta.headerValue("Etag")
+		if !ok || cachedETag == "" {
+			return false
+		}
+		if strings.TrimSpace(inm) == "*" {
+			return true
+		}
+		for _, tag := range strings.Split(inm, ",") {
+			if etagWeakEqual(strings.TrimSpace(tag), cachedETag) {
 				return true
 			}
-			// Check comma-separated list of ETags
-			for _, etag := range strings.Split(ifNoneMatch, ",") {
-				etag = strings.TrimSpace(etag)
-				if etag == cachedETag {
-					return true
-				}
-			}
 		}
+		return false
 	}
 
-	// Check If-Modified-Since (Last-Modified validation)
-	ifModifiedSince := r.Header.Get("If-Modified-Since")
-	if ifModifiedSince != "" {
-		// Extract Last-Modified from cached headers
-		cachedLastModified := ""
-		for _, kv := range cacheMeta.Header {
-			if len(kv) == 2 && kv[0] == "Last-Modified" {
-				cachedLastModified = kv[1]
-				break
-			}
+	if ims := r.Header.Get("If-Modified-Since"); ims != "" {
+		cachedLM, ok := cacheMeta.headerValue("Last-Modified")
+		if !ok {
+			return false
 		}
-
-		if cachedLastModified != "" {
-			// Parse both times
-			ifModTime, err1 := http.ParseTime(ifModifiedSince)
-			lastModTime, err2 := http.ParseTime(cachedLastModified)
-
-			// If parsing succeeded and content hasn't been modified, return 304
-			if err1 == nil && err2 == nil {
-				// Content not modified if cached time is before or equal to request time
-				if !lastModTime.After(ifModTime) {
-					return true
-				}
-			}
+		imsTime, err1 := http.ParseTime(ims)
+		lmTime, err2 := http.ParseTime(cachedLM)
+		if err1 == nil && err2 == nil && !lmTime.After(imsTime) {
+			return true
 		}
 	}
-
 	return false
 }
 
-// ServeHTTP implements the caddy.Handler interface.
-func (c *Cache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	bypass := false
-	c.logger.Debug("HTTP Version", zap.String("Version", r.Proto))
+// etagWeakEqual compares ETags using the weak-comparison rules (RFC 7232 §2.3.2):
+// the optional W/ prefix is ignored on both sides.
+func etagWeakEqual(a, b string) bool {
+	return strings.TrimPrefix(a, "W/") == strings.TrimPrefix(b, "W/")
+}
 
+// ServeHTTP implements caddyhttp.MiddlewareHandler.
+func (c *Cache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	reqHdr := r.Header
 	db := c.Store
-	if strings.HasPrefix(r.URL.Path, c.PurgePath) {
-		key := reqHdr.Get(c.PurgeKeyHeader)
-		if key != c.PurgeKey {
-			c.logger.Warn("wp cache - purge - invalid key", zap.String("path", r.URL.Path))
-		} else {
-			switch r.Method {
-			case "GET":
-				cacheList := db.List()
-				json.NewEncoder(w).Encode(cacheList)
-				return nil
-
-			case "POST":
-				pathToPurge := strings.Replace(r.URL.Path, c.PurgePath, "", 1)
-				c.logger.Debug("wp cache - purge", zap.String("path", pathToPurge))
-
-				// TODO: fix concurrent issue when flush/pruge running and new cache setting
-				if len(pathToPurge) < 2 {
-					go db.Flush()
-				} else {
-					go db.Purge(pathToPurge)
-				}
-				w.Write([]byte("OK"))
-				return nil
-			}
-		}
-	}
-
-	// only GET Method can cache
-	if r.Method != "GET" {
-		return next.ServeHTTP(w, r)
-	}
-
-	if c.BypassDebugQuery != "" {
-		bypass = r.URL.Query().Has(c.BypassDebugQuery)
-	}
-
-	if !bypass {
-		for _, prefix := range c.BypassPathPrefixes {
-			if strings.HasPrefix(r.URL.Path, prefix) && prefix != "" {
-				c.logger.Debug("wp cache - bypass prefix", zap.String("prefix", prefix))
-				bypass = true
-				break
-			}
-		}
-	}
-
-	// bypass by regex
-	// default: ".*(\\.[^.]+)$", bypass all media, images, css, js, etc
-	if !bypass && c.pathRx != nil {
-		bypass = c.pathRx.MatchString(r.URL.Path)
-		if bypass {
-			c.logger.Debug("wp cache - bypass regex", zap.String("regex", c.BypassPathRegex))
-		}
-	}
-
-	if !bypass && c.BypassHome && r.URL.Path == "/" {
-		bypass = true
-	}
-
-	// bypass if is logged in. We don't want to cache admin bars
-	if !bypass {
-		cookies := r.Cookies()
-		for _, cookie := range cookies {
-			if strings.HasPrefix(cookie.Name, "wordpress_logged_in") {
-				bypass = true
-				break
-			}
-		}
-	}
-
 	hdr := w.Header()
-	if bypass {
-		hdr.Set(c.CacheHeaderName, "BYPASS")
+
+	// Purge / flush API — disabled entirely when no key is configured (fail closed).
+	if c.PurgeKey != "" && strings.HasPrefix(r.URL.Path, c.PurgePath) {
+		provided := reqHdr.Get(c.PurgeKeyHeader)
+		if provided == "" {
+			return caddyhttp.Error(http.StatusUnauthorized, fmt.Errorf("wp_cache: missing purge key"))
+		}
+		ph := sha256.Sum256([]byte(provided))
+		kh := sha256.Sum256([]byte(c.PurgeKey))
+		if subtle.ConstantTimeCompare(ph[:], kh[:]) != 1 {
+			c.logger.Warn("wp cache - purge - invalid key", zap.String("path", r.URL.Path))
+			return caddyhttp.Error(http.StatusForbidden, fmt.Errorf("wp_cache: invalid purge key"))
+		}
+
+		switch r.Method {
+		case http.MethodGet:
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(db.List()); err != nil {
+				c.logger.Error("wp cache - list encode", zap.Error(err))
+			}
+			return nil
+		case http.MethodPost:
+			pathToPurge := strings.TrimPrefix(r.URL.Path, c.PurgePath)
+			if len(pathToPurge) < 2 {
+				c.logger.Info("wp cache - flush all")
+				recordEvent("flush")
+				safeGo(c.logger, func() { _ = db.Flush() })
+			} else {
+				c.logger.Info("wp cache - purge", zap.String("path", pathToPurge))
+				recordEvent("purge")
+				safeGo(c.logger, func() { db.Purge(pathToPurge) })
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("OK"))
+			return nil
+		default:
+			return caddyhttp.Error(http.StatusMethodNotAllowed, nil)
+		}
+	}
+
+	// Only GET is cacheable.
+	if r.Method != http.MethodGet {
 		return next.ServeHTTP(w, r)
 	}
 
-	// TODO: custom cacheKey by query, header ...
-	cacheKey := ""
-	cacheKey = c.Store.buildCacheKey(r.URL.Path, cacheKey)
+	if c.bypass(r) {
+		hdr.Set(c.CacheHeaderName, "BYPASS")
+		recordEvent("bypass")
+		return next.ServeHTTP(w, r)
+	}
+
+	variant, cacheable := c.normalizeQuery(r.URL)
+	if !cacheable {
+		hdr.Set(c.CacheHeaderName, "BYPASS")
+		recordEvent("bypass")
+		return next.ServeHTTP(w, r)
+	}
 
 	requestEncoding := strings.Split(strings.Join(reqHdr["Accept-Encoding"], ""), ",")
 	if len(requestEncoding) == 1 && len(requestEncoding[0]) == 0 {
@@ -415,53 +468,48 @@ func (c *Cache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp
 	}
 	requestEncoding = append(requestEncoding, "none")
 
-	// TODO: if only have uncompressed data, we should try to cached a compressed version
 	var cacheData []byte
 	var cacheMeta *CacheMeta
 	var err error
 	ce := ""
 	for _, re := range requestEncoding {
 		ce = strings.TrimSpace(re)
-		cacheData, cacheMeta, err = db.Get(cacheKey, ce)
+		cacheData, cacheMeta, err = db.Get(r.Context(), r.URL.Path, variant, ce)
 		if err == nil {
 			break
 		}
 	}
+
 	if err == nil {
-		// TODO: some limit prevent self-DoS
-		if ce == "none" && requestEncoding[0] != "none" {
-			go c.doCache(r, next)
+		// Only an uncompressed variant is cached but the client accepts
+		// compression: warm a compressed copy in the background (bounded).
+		if ce == "none" && len(requestEncoding) > 0 && requestEncoding[0] != "none" {
+			c.triggerPreload(r, next, variant)
 		}
 
-		// Check for conditional requests (If-None-Match, If-Modified-Since)
 		if checkConditionalRequest(r, cacheMeta) {
-			// Content hasn't changed, return 304 Not Modified
 			hdr.Set(c.CacheHeaderName, "HIT-304")
+			recordEvent("hit_304")
 			hdr.Set("Vary", "Accept-Encoding")
-
-			// Set validation headers (ETag, Last-Modified) from cache
 			for _, kv := range cacheMeta.Header {
 				if len(kv) != 2 {
 					continue
 				}
-				// Only include specific headers for 304 response
-				if kv[0] == "Etag" || kv[0] == "Last-Modified" || kv[0] == "Cache-Control" || kv[0] == "Expires" {
+				switch kv[0] {
+				case "Etag", "Last-Modified", "Cache-Control", "Expires":
 					hdr.Set(kv[0], kv[1])
 				}
 			}
-
-			w.WriteHeader(http.StatusNotModified) // 304
-			// Don't send body for 304 responses
+			w.WriteHeader(http.StatusNotModified)
 			return nil
 		}
 
-		// No conditional request or content has changed, send full response
 		hdr.Set(c.CacheHeaderName, "HIT")
+		recordEvent("hit")
 		hdr.Set("Vary", "Accept-Encoding")
 		if ce != "none" {
 			hdr.Set("Content-Encoding", ce)
 		}
-		// set header back
 		for _, kv := range cacheMeta.Header {
 			if len(kv) != 2 {
 				continue
@@ -469,35 +517,89 @@ func (c *Cache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp
 			hdr.Set(kv[0], kv[1])
 		}
 		w.WriteHeader(cacheMeta.StateCode)
-		w.Write(cacheData)
-
+		_, _ = w.Write(cacheData)
 		return nil
 	}
-	c.logger.Debug("wp cache - error - "+cacheKey, zap.Error(err))
 
-	nw := NewCustomWriter(w, r, db, c.logger, c)
-	defer nw.Close()
+	recordEvent("miss")
+	nw := NewCustomWriter(w, r, db, c.logger, c, variant)
+	defer func() { _ = nw.Close() }()
 	return next.ServeHTTP(nw, r)
 }
 
-func (c *Cache) doCache(r0 *http.Request, next caddyhttp.Handler) {
-	r := r0.Clone(context.Background())
+func (c *Cache) bypass(r *http.Request) bool {
+	if c.BypassDebugQuery != "" && r.URL.Query().Has(c.BypassDebugQuery) {
+		return true
+	}
+	for _, prefix := range c.BypassPathPrefixes {
+		if prefix != "" && strings.HasPrefix(r.URL.Path, prefix) {
+			return true
+		}
+	}
+	if c.pathRx != nil && c.pathRx.MatchString(r.URL.Path) {
+		return true
+	}
+	if c.BypassHome && r.URL.Path == "/" {
+		return true
+	}
+	for _, cookie := range r.Cookies() {
+		if strings.HasPrefix(cookie.Name, "wordpress_logged_in") {
+			return true
+		}
+	}
+	return false
+}
+
+// triggerPreload runs a bounded, deduplicated background re-render to warm a
+// compressed variant. It never blocks the request and recovers from panics.
+func (c *Cache) triggerPreload(r *http.Request, next caddyhttp.Handler, variant string) {
+	select {
+	case c.preloadSem <- struct{}{}:
+	default:
+		return // at capacity — skip
+	}
+	key := r.URL.Path + "::" + variant
+	safeGo(c.logger, func() {
+		defer func() { <-c.preloadSem }()
+		_, _, _ = c.preloadGroup.Do(key, func() (interface{}, error) {
+			c.doCache(r, next, variant)
+			return nil, nil
+		})
+	})
+}
+
+func (c *Cache) doCache(r0 *http.Request, next caddyhttp.Handler, variant string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	r := r0.Clone(ctx)
 	repl := caddy.NewReplacer()
 	r = caddyhttp.PrepareRequest(r, repl, nil, nil)
-	c.logger.Debug("wp cache - preload - ", zap.String("path", r.URL.Path))
-	db := c.Store
-	w := &NopResponseWriter{}
-	nw := NewCustomWriter(w, r, db, c.logger, c)
-	defer nw.Close()
-	next.ServeHTTP(nw, r)
+
+	nw := NewCustomWriter(&NopResponseWriter{}, r, c.Store, c.logger, c, variant)
+	defer func() { _ = nw.Close() }()
+	_ = next.ServeHTTP(nw, r)
+}
+
+// safeGo runs fn in a goroutine, recovering panics so a background failure never
+// crashes the server.
+func safeGo(logger *zap.Logger, fn func()) {
+	go func() {
+		defer func() {
+			if p := recover(); p != nil {
+				logger.Error("wp cache - goroutine panic", zap.Any("panic", p), zap.Stack("stack"))
+			}
+		}()
+		fn()
+	}()
 }
 
 // Interface guards
 var (
 	_ caddy.Provisioner           = (*Cache)(nil)
+	_ caddy.Validator             = (*Cache)(nil)
 	_ caddyhttp.MiddlewareHandler = (*Cache)(nil)
 	_ caddyfile.Unmarshaler       = (*Cache)(nil)
-	// _ caddy.Validator             = (*Cache)(nil)
 
 	_ http.ResponseWriter = (*NopResponseWriter)(nil)
 )
@@ -506,10 +608,6 @@ type NopResponseWriter map[string][]string
 
 func (nop *NopResponseWriter) WriteHeader(statusCode int) {}
 
-func (nop *NopResponseWriter) Write(buf []byte) (int, error) {
-	return len(buf), nil
-}
+func (nop *NopResponseWriter) Write(buf []byte) (int, error) { return len(buf), nil }
 
-func (nop *NopResponseWriter) Header() http.Header {
-	return http.Header(*nop)
-}
+func (nop *NopResponseWriter) Header() http.Header { return http.Header(*nop) }

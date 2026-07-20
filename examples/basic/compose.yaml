@@ -1,6 +1,6 @@
 services:
   wordpress:
-    image: wpeverywhere/frankenwp:latest-php8.3
+    image: wpeverywhere/frankenwp:latest-php8.4
     restart: always
     ports:
       - "8100:80" # HTTP
@@ -14,18 +14,20 @@ services:
       WORDPRESS_TABLE_PREFIX: ${DB_TABLE_PREFIX:-wp_}
       CACHE_LOC: ${CACHE_LOC:-/var/www/html/wp-content/cache}
       TTL: ${TTL:-80000}
+      QUERY_MODE: ${QUERY_MODE:-strip}
       PURGE_PATH: ${PURGE_PATH:-/__cache/purge}
+      # Set a strong PURGE_KEY to enable the purge/flush endpoint. When empty the
+      # endpoint is disabled (fails closed).
       PURGE_KEY: ${PURGE_KEY:-}
       BYPASS_HOME: ${BYPASS_HOME:-false}
       BYPASS_PATH_PREFIXES: ${BYPASS_PATH_PREFIXES:-/wp-admin,/wp-content,/wp-includes,/wp-json,/feed}
-      CACHE_RESPONSE_CODES: ${CACHE_RESPONSE_CODES:-000}
+      CACHE_RESPONSE_CODES: ${CACHE_RESPONSE_CODES:-200,404,405}
       # Cloudflare cache purging (optional)
       CLOUDFLARE_ZONE_ID: ${CLOUDFLARE_ZONE_ID:-}
       CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
       CADDY_GLOBAL_OPTIONS: |
         email myemail@sample.com
         auto_https disable_redirects
-        debug
       WORDPRESS_CONFIG_EXTRA: |
           define('WP_SITEURL', 'http://localhost:8100');
           define('WP_HOME', 'http://localhost:8100');

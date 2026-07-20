@@ -1,0 +1,25 @@
+# VCS / CI
+.git
+.github
+.gitignore
+
+# Secrets & local env — never bake into an image
+.env
+.env.*
+**/.env
+**/.env.*
+
+# Dev artifacts
+.tmp
+.air.toml
+**/node_modules
+
+# Docs & examples (not needed for the root image build)
+*.md
+examples/
+
+# Go test files are not needed for the xcaddy build
+sidekick/**/*_test.go
+
+# Agent/plan artifacts
+.claude/

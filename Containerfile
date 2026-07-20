@@ -1,8 +1,10 @@
-ARG WORDPRESS_VERSION=latest
+# Pinned for reproducible builds. Renovate keeps these current (see renovate.json).
+ARG WORDPRESS_VERSION=6.9
 ARG PHP_VERSION=8.4
+ARG FRANKENPHP_VERSION=1.12
 ARG USER=www-data
 
-FROM docker.io/dunglas/frankenphp:builder-php${PHP_VERSION} as builder
+FROM docker.io/dunglas/frankenphp:${FRANKENPHP_VERSION}-builder-php${PHP_VERSION}-bookworm AS builder
 
 # Copy xcaddy in the builder image
 COPY --from=caddy:builder /usr/bin/xcaddy /usr/bin/xcaddy
@@ -34,8 +36,8 @@ RUN --mount=type=cache,target=/root/go/pkg/mod \
     # Add extra Caddy modules here
     --with github.com/stephenmiracle/frankenwp/sidekick/middleware/cache=./cache
 
-FROM docker.io/wordpress:$WORDPRESS_VERSION as wp
-FROM docker.io/dunglas/frankenphp:php${PHP_VERSION} AS base
+FROM docker.io/wordpress:${WORDPRESS_VERSION} AS wp
+FROM docker.io/dunglas/frankenphp:${FRANKENPHP_VERSION}-php${PHP_VERSION}-bookworm AS base
 
 LABEL org.opencontainers.image.title=FrankenWP \
       org.opencontainers.image.description="Optimized WordPress containers to run everywhere. Built with FrankenPHP & Caddy." \
@@ -47,6 +49,7 @@ LABEL org.opencontainers.image.title=FrankenWP \
 # Replace the official binary by the one contained your custom modules
 COPY --from=builder /usr/local/bin/frankenphp /usr/local/bin/frankenphp
 
+ARG DEBUG=""
 ENV WP_DEBUG=${DEBUG:+1} \
     FORCE_HTTPS=0 \
     PHP_INI_SCAN_DIR=$PHP_INI_DIR/conf.d
@@ -110,12 +113,24 @@ VOLUME /var/www/html/wp-content
 
 COPY Caddyfile /etc/caddy/Caddyfile
 
-# Set user, capabilities, and permissions in one layer
-RUN useradd -D ${USER} \
+# Re-declare here: a global ARG (before the first FROM) is not expanded inside a
+# build stage unless re-declared. Without this, ${USER} is empty and the image
+# would run as root.
+ARG USER=www-data
+
+# Set user, capabilities, and permissions in one layer. www-data already exists
+# in the base image; create it only if a custom USER was supplied.
+RUN (id -u ${USER} >/dev/null 2>&1 || useradd -m ${USER}) \
     && setcap CAP_NET_BIND_SERVICE=+eip /usr/local/bin/frankenphp \
+    && mkdir -p /data/caddy /config/caddy \
     && chown -R ${USER}:${USER} /data/caddy /config/caddy /var/www/html /usr/src/wordpress /usr/local/bin/docker-entrypoint.sh
 
 USER $USER
+
+# Liveness/readiness probe hits the lightweight /healthz route (served by Caddy
+# without invoking PHP). See Caddyfile.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
+    CMD curl -fsS http://127.0.0.1/healthz || exit 1
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["frankenphp", "run", "--config", "/etc/caddy/Caddyfile"]

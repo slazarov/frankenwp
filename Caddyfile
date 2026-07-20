@@ -4,7 +4,7 @@
     {$CADDY_GLOBAL_OPTIONS}
 
     frankenphp {
-       #worker /path/to/your/worker.php
+       #worker /path/to/your/worker.php  # classic mode by default; worker mode is an opt-in (see docs)
        {$FRANKENPHP_CONFIG}
     }
 
@@ -22,16 +22,24 @@
 # You may not have the hostname being called due to dynamic IPs and load balancers.
 # Allowing all hosts on port 80 for health checks, local dev & cases where the hostname is unknown.
 {$SERVER_NAME:localhost} {
-	@static {
-		file
-		path *.ico *.css *.js *.gif *.jpg *.jpeg *.png *.svg *.woff *.woff2 *.ttf *.webp
-	}
+	# Lightweight health/readiness probe — answered by Caddy without invoking PHP.
+	@health path /healthz
+	respond @health "ok" 200
 
-	# Set long cache times for static assets (1 year)
-	# Safe because WordPress uses versioned URLs (?ver=x.x.x)
-	header @static {
-		Cache-Control "public, max-age=31536000, immutable"
+	# Versioned assets (WordPress appends ?ver=x.x.x) may be cached forever.
+	@immutable {
+		file
+		path *.css *.js *.woff *.woff2 *.ttf *.otf *.eot
 	}
+	header @immutable Cache-Control "public, max-age=31536000, immutable"
+
+	# Media/uploads are NOT versioned — cache for 30 days but allow revalidation
+	# so a replaced image at the same URL is picked up.
+	@media {
+		file
+		path *.ico *.gif *.jpg *.jpeg *.png *.svg *.webp *.avif
+	}
+	header @media Cache-Control "public, max-age=2592000"
 
     @disallowed {
        path /xmlrpc.php
@@ -54,11 +62,12 @@
        loc {$CACHE_LOC:/var/www/html/wp-content/cache}
        cache_response_codes {$CACHE_RESPONSE_CODES:200,404,405}
        ttl {$TTL:6000}
+       query_mode {$QUERY_MODE:strip}
        purge_path {$PURGE_PATH:/__cache/purge}
        purge_key {$PURGE_KEY}
        bypass_home {$BYPASS_HOME:false}
-       bypass_path_prefixes {$BYPASS_PATH_PREFIXES:/wp-admin,/wp-json}
-       cache_header_name {$CACHE_HEADER_NAME:X-Custom-Cache}
+       bypass_path_prefixes {$BYPASS_PATH_PREFIXES:/wp-admin,/wp-json,/wp-login.php}
+       cache_header_name {$CACHE_HEADER_NAME:X-FrankenWP-Cache}
        memory_item_max_size {$CACHE_MEM_ITEM_SIZE:4194304}
        memory_max_size {$CACHE_MEM_ALL_SIZE:134217728}
        memory_max_count {$CACHE_MEM_ALL_COUNT:32768}
