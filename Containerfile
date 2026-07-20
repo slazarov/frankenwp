@@ -7,7 +7,7 @@ ARG USER=www-data
 FROM docker.io/dunglas/frankenphp:${FRANKENPHP_VERSION}-builder-php${PHP_VERSION}-bookworm AS builder
 
 # Copy xcaddy in the builder image
-COPY --from=caddy:builder /usr/bin/xcaddy /usr/bin/xcaddy
+COPY --from=docker.io/library/caddy:builder /usr/bin/xcaddy /usr/bin/xcaddy
 
 # build cache for FrankenPHP
 RUN --mount=type=cache,target=/root/go/pkg/mod \
